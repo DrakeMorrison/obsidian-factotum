@@ -70,6 +70,5 @@ That's it. The list is the ranking; nothing extra is written to the file.
 
 ## Tips
 
-- The plugin will strip any leftover `elo_scores:` frontmatter block from older versions on the next save.
 - You can freely edit the list by hand between sessions — new bullets are picked up automatically next time you run a session or use add-item.
 - Data never leaves your machine. Everything is local markdown.

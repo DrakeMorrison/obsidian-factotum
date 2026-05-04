@@ -18,27 +18,11 @@ function parseItems(content) {
 }
 
 function serializeBack(content, sortedItems) {
-    let body = content;
-    let fmContent = '';
-    let hadFrontmatter = false;
-    const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n?/);
-    if (fmMatch) {
-        hadFrontmatter = true;
-        body = content.slice(fmMatch[0].length);
-        // Strip any legacy elo_scores block
-        fmContent = fmMatch[1].replace(/^elo_scores:\n(?:[ \t]+.+\n?)*/m, '').trimEnd();
-    }
-
     const replacements = sortedItems.map(i => `- ${i.text}`);
     let idx = 0;
-    const newBody = body.replace(/^[-*+] (?!\[[xX]\]\s).+$/gm, () =>
+    return content.replace(/^[-*+] (?!\[[xX]\]\s).+$/gm, () =>
         idx < replacements.length ? replacements[idx++] : ''
     );
-
-    if (hadFrontmatter && fmContent) {
-        return `---\n${fmContent}\n---\n${newBody}`;
-    }
-    return newBody;
 }
 
 // ── Pairwise ranking session (interactive merge sort) ───────────────────────
