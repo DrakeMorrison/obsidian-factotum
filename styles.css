@@ -178,3 +178,27 @@
     margin: 4px 0 12px;
     line-height: 1.5;
 }
+
+/* Quadrant label badge above comparison header */
+.ordinal-quadrant-label {
+    display: inline-block;
+    padding: 3px 10px;
+    margin-bottom: 8px;
+    background: var(--background-modifier-border);
+    color: var(--text-muted);
+    border-radius: 999px;
+    font-size: 0.75em;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+}
+
+/* Per-quadrant section header in results view */
+.ordinal-quadrant-header {
+    margin: 18px 0 6px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--background-modifier-border);
+    color: var(--text-normal);
+    font-size: 0.95em;
+    font-weight: 600;
+}
