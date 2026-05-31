@@ -5,6 +5,17 @@
     width: 90vw;
 }
 
+/* Mobile: pin modal near the top so the on-screen keyboard doesn't cover the input. */
+body.is-mobile .modal-container:has(.ordinal-modal) {
+    align-items: flex-start;
+}
+
+body.is-mobile .modal.ordinal-modal {
+    margin-top: 12px;
+    width: 96vw;
+    max-height: calc(100vh - 24px);
+}
+
 /* Progress bar */
 .ordinal-progress {
     position: relative;

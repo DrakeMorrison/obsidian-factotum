@@ -328,7 +328,17 @@ class AddItemModal extends obsidian.Modal {
     renderInput() {
         const { contentEl } = this;
         contentEl.empty();
-        contentEl.createEl('h2', { text: 'Add New Item' });
+
+        const input = contentEl.createEl('input', {
+            type: 'text',
+            placeholder: 'What do you want to do?'
+        });
+        input.addClass('ordinal-text-input');
+
+        const btn = contentEl.createEl('button', {
+            text: this.payload.mode === 'flat' ? 'Start placing →' : 'Next: classify →',
+            cls: 'ordinal-save-btn'
+        });
 
         if (this.payload.mode === 'flat') {
             const n = this.payload.items.length;
@@ -344,17 +354,7 @@ class AddItemModal extends obsidian.Modal {
             });
         }
 
-        const input = contentEl.createEl('input', {
-            type: 'text',
-            placeholder: 'What do you want to do?'
-        });
-        input.addClass('ordinal-text-input');
         input.focus();
-
-        const btn = contentEl.createEl('button', {
-            text: this.payload.mode === 'flat' ? 'Start placing →' : 'Next: classify →',
-            cls: 'ordinal-save-btn'
-        });
 
         const go = () => {
             const val = input.value.trim();
