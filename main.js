@@ -607,8 +607,98 @@ function totalActiveItems(parsed) {
     return QUADRANTS.reduce((sum, q) => sum + parsed.sections[q.key].length, 0);
 }
 
+// ── Beeminder daily word count ──────────────────────────────────────────────
+
+const DEFAULT_SETTINGS = {
+    beeminder: {
+        enabled: false,
+        authToken: '',
+        username: '',
+        goalName: '',
+        templatePath: '',          // optional override; blank = auto-detect
+        lastSubmittedDaystamp: '', // YYYYMMDD of the last successful send
+    },
+};
+
+function stripFrontmatter(text) {
+    return text.replace(/^﻿?---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+}
+
+// Count word-like tokens (letters/numbers), ignoring markdown punctuation like
+// bullets and heading markers. Frontmatter is excluded so YAML keys don't count.
+function countWords(text) {
+    if (!text) return 0;
+    const m = stripFrontmatter(text).match(/[\p{L}\p{N}_'’]+/gu);
+    return m ? m.length : 0;
+}
+
+// Resolve the daily-note folder/format/template from Periodic Notes if present,
+// otherwise the core Daily Notes plugin. Returns null if neither is available.
+function getDailyNoteConfig(app) {
+    const periodic = app.plugins?.getPlugin?.('periodic-notes');
+    const daily = periodic?.settings?.daily;
+    if (daily && daily.enabled !== false && (daily.format || daily.folder)) {
+        return { folder: daily.folder || '', format: daily.format || 'YYYY-MM-DD', template: daily.template || '' };
+    }
+    const core = app.internalPlugins?.getPluginById?.('daily-notes');
+    const opts = core?.instance?.options;
+    if (opts) {
+        return { folder: opts.folder || '', format: opts.format || 'YYYY-MM-DD', template: opts.template || '' };
+    }
+    return null;
+}
+
+function dailyNotePath(config, m) {
+    const filename = (m || obsidian.moment()).format(config.format || 'YYYY-MM-DD') + '.md';
+    const folder = (config.folder || '').replace(/\/+$/, '');
+    return obsidian.normalizePath(folder ? `${folder}/${filename}` : filename);
+}
+
+function resolveTemplatePath(rawPath) {
+    let p = (rawPath || '').trim();
+    if (!p) return null;
+    if (!p.toLowerCase().endsWith('.md')) p += '.md';
+    return obsidian.normalizePath(p);
+}
+
+async function readWordCount(app, path) {
+    if (!path) return 0;
+    const file = app.vault.getAbstractFileByPath(path);
+    if (file instanceof obsidian.TFile) {
+        return countWords(await app.vault.cachedRead(file));
+    }
+    return 0;
+}
+
+async function submitToBeeminder(s, value, daystamp, comment) {
+    const url = `https://www.beeminder.com/api/v1/users/${encodeURIComponent(s.username)}/goals/${encodeURIComponent(s.goalName)}/datapoints.json`;
+    const body = new URLSearchParams({
+        auth_token: s.authToken,
+        value: String(value),
+        daystamp: daystamp,
+        comment: comment || '',
+        // Stable per-day id: re-running the same day updates rather than duplicates.
+        requestid: `factotum-wordcount-${daystamp}`,
+    }).toString();
+    return obsidian.requestUrl({
+        url,
+        method: 'POST',
+        contentType: 'application/x-www-form-urlencoded',
+        body,
+        throw: false,
+    });
+}
+
 class DrakeFactotumPlugin extends obsidian.Plugin {
     async onload() {
+        await this.loadSettings();
+        this.addSettingTab(new FactotumSettingTab(this.app, this));
+        this.beeminderTimer = null;
+        this.app.workspace.onLayoutReady(() => {
+            this.maybeCatchUpBeeminder();
+            this.scheduleBeeminderSubmission();
+        });
+
         this.addCommand({
             id: 'ordinal-rank-list',
             name: 'Start ranking session',
@@ -664,7 +754,160 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     }
 
     onunload() {
+        this.clearBeeminderTimer();
         console.log('Drake\'s Factotum unloaded');
+    }
+
+    async loadSettings() {
+        const data = await this.loadData();
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+        this.settings.beeminder = Object.assign({}, DEFAULT_SETTINGS.beeminder, data?.beeminder);
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings);
+    }
+
+    clearBeeminderTimer() {
+        if (this.beeminderTimer !== null) {
+            window.clearTimeout(this.beeminderTimer);
+            this.beeminderTimer = null;
+        }
+    }
+
+    // (Re)arm a timer that fires at the next 11PM, submits, then re-arms itself.
+    scheduleBeeminderSubmission() {
+        this.clearBeeminderTimer();
+        if (!this.settings.beeminder.enabled) return;
+        const now = obsidian.moment();
+        const next = obsidian.moment().hour(23).minute(0).second(0).millisecond(0);
+        if (next.isSameOrBefore(now)) next.add(1, 'day');
+        this.beeminderTimer = window.setTimeout(async () => {
+            await this.runBeeminderSubmission('scheduled 11PM');
+            this.scheduleBeeminderSubmission();
+        }, next.diff(now));
+    }
+
+    // If a scheduled 11PM submission was missed (Obsidian closed at the time),
+    // catch up on open by submitting for the most recent 11PM deadline that has
+    // already passed — which is yesterday if it's currently before 11PM today.
+    async maybeCatchUpBeeminder() {
+        if (!this.settings.beeminder.enabled) return;
+        const now = obsidian.moment();
+        const deadline = obsidian.moment().hour(23).minute(0).second(0).millisecond(0);
+        if (deadline.isAfter(now)) deadline.subtract(1, 'day');
+        if (this.settings.beeminder.lastSubmittedDaystamp !== deadline.format('YYYYMMDD')) {
+            await this.runBeeminderSubmission('catch-up on open', deadline);
+        }
+    }
+
+    async runBeeminderSubmission(reason, targetMoment = null, notify = false) {
+        const s = this.settings.beeminder;
+        if (!s.enabled) return;
+        if (!s.authToken || !s.username || !s.goalName) {
+            if (notify) new obsidian.Notice('Drake\'s Factotum: Beeminder not configured (token, user, and goal required).');
+            return;
+        }
+        const config = getDailyNoteConfig(this.app);
+        if (!config) {
+            new obsidian.Notice('Drake\'s Factotum: could not find a Daily Notes / Periodic Notes config.');
+            return;
+        }
+        const day = targetMoment || obsidian.moment();
+        const noteWords = await readWordCount(this.app, dailyNotePath(config, day));
+        const templatePath = resolveTemplatePath(s.templatePath || config.template);
+        const templateWords = await readWordCount(this.app, templatePath);
+        const value = Math.max(0, noteWords - templateWords);
+        const daystamp = day.format('YYYYMMDD');
+        const comment = `daily note word count: ${noteWords} − ${templateWords} (template) [${reason}]`;
+
+        try {
+            const res = await submitToBeeminder(s, value, daystamp, comment);
+            if (res.status >= 200 && res.status < 300) {
+                s.lastSubmittedDaystamp = daystamp;
+                await this.saveSettings();
+                new obsidian.Notice(`Drake's Factotum: sent ${value} words to Beeminder ✓`);
+            } else {
+                new obsidian.Notice(`Drake's Factotum: Beeminder rejected the submission (HTTP ${res.status}).`);
+                console.error('Drake\'s Factotum — Beeminder error', res.status, res.text);
+            }
+        } catch (e) {
+            new obsidian.Notice('Drake\'s Factotum: Beeminder submission failed (network error).');
+            console.error('Drake\'s Factotum — Beeminder request failed', e);
+        }
+    }
+}
+
+class FactotumSettingTab extends obsidian.PluginSettingTab {
+    constructor(app, plugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
+
+    display() {
+        const { containerEl } = this;
+        containerEl.empty();
+        const b = this.plugin.settings.beeminder;
+
+        new obsidian.Setting(containerEl)
+            .setName('Beeminder daily word count')
+            .setHeading();
+
+        containerEl.createEl('p', {
+            text: 'At 11PM each night, send the word count of today\'s daily note (minus the daily note template\'s word count) to a Beeminder goal.',
+            cls: 'ordinal-hint',
+        });
+
+        new obsidian.Setting(containerEl)
+            .setName('Enable nightly submission')
+            .setDesc('Send the count automatically at 11PM, and catch up on startup if the app was closed at 11PM.')
+            .addToggle(t => t
+                .setValue(b.enabled)
+                .onChange(async (v) => {
+                    b.enabled = v;
+                    await this.plugin.saveSettings();
+                    this.plugin.scheduleBeeminderSubmission();
+                }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Beeminder auth token')
+            .setDesc('From beeminder.com/api/v1/auth_token.json (or your account settings).')
+            .addText(t => {
+                t.setPlaceholder('auth token')
+                    .setValue(b.authToken)
+                    .onChange(async (v) => { b.authToken = v.trim(); await this.plugin.saveSettings(); });
+                t.inputEl.type = 'password';
+            });
+
+        new obsidian.Setting(containerEl)
+            .setName('Beeminder username')
+            .addText(t => t
+                .setPlaceholder('username')
+                .setValue(b.username)
+                .onChange(async (v) => { b.username = v.trim(); await this.plugin.saveSettings(); }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Beeminder goal name')
+            .setDesc('The goal slug, e.g. "writing" from beeminder.com/you/writing.')
+            .addText(t => t
+                .setPlaceholder('goal')
+                .setValue(b.goalName)
+                .onChange(async (v) => { b.goalName = v.trim(); await this.plugin.saveSettings(); }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Daily note template path (optional)')
+            .setDesc('Leave blank to auto-detect from your Daily Notes / Periodic Notes settings. Its word count is subtracted from the daily note before sending.')
+            .addText(t => t
+                .setPlaceholder('Templates/Daily.md')
+                .setValue(b.templatePath)
+                .onChange(async (v) => { b.templatePath = v.trim(); await this.plugin.saveSettings(); }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Send today\'s count now')
+            .setDesc('Submit immediately to test your configuration.')
+            .addButton(btn => btn
+                .setButtonText('Send now')
+                .onClick(() => this.plugin.runBeeminderSubmission('manual send', null, true)));
     }
 }
 

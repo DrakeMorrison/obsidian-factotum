@@ -51,6 +51,19 @@ Type your new item, then answer ~log₂(n) comparisons to slot it in the right p
 
 Lines like `- [x] done thing` are skipped — they don't appear in comparisons and stay put when the list is rewritten. Active tasks (`- [ ] thing`) and plain bullets (`- thing`) are both ranked.
 
+### Nightly word count → Beeminder
+
+Optionally, the plugin can post your daily writing output to a [Beeminder](https://www.beeminder.com) goal every night at **11PM**.
+
+Enable it in **Settings → Drake's Factotum** and fill in:
+
+- **Auth token** — from `beeminder.com/api/v1/auth_token.json`
+- **Username** and **goal name** (the goal slug, e.g. `writing`)
+
+Each night it counts the words in today's daily note, **subtracts the word count of your daily note template** (so boilerplate doesn't inflate the number), and sends the result. The daily note and template are located automatically from your **Daily Notes** or **Periodic Notes** settings; you can override the template path in settings if needed.
+
+If Obsidian wasn't open at 11PM, it catches up the next time you launch (provided it's still past 11PM and that day hasn't been sent yet). Re-sends for the same day update the datapoint rather than duplicating it. Use **Send now** in settings to test your setup.
+
 ---
 
 ## How your note looks after ranking
