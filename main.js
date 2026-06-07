@@ -700,7 +700,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         });
 
         this.addCommand({
-            id: 'ordinal-rank-list',
+            id: 'factotum-rank-list',
             name: 'Start ranking session',
             editorCallback: (editor) => {
                 const content = editor.getValue();
@@ -717,7 +717,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         });
 
         this.addCommand({
-            id: 'ordinal-add-item',
+            id: 'factotum-add-item',
             name: 'Add new item (binary-search placement)',
             editorCallback: (editor) => {
                 const content = editor.getValue();
@@ -730,7 +730,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         });
 
         this.addCommand({
-            id: 'ordinal-convert-matrix',
+            id: 'factotum-convert-matrix',
             name: 'Convert flat list to Eisenhower matrix',
             editorCallback: (editor) => {
                 const content = editor.getValue();
