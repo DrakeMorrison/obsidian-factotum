@@ -607,7 +607,7 @@ function totalActiveItems(parsed) {
     return QUADRANTS.reduce((sum, q) => sum + parsed.sections[q.key].length, 0);
 }
 
-class OrdinalRankingPlugin extends obsidian.Plugin {
+class DrakeFactotumPlugin extends obsidian.Plugin {
     async onload() {
         this.addCommand({
             id: 'ordinal-rank-list',
@@ -616,12 +616,12 @@ class OrdinalRankingPlugin extends obsidian.Plugin {
                 const content = editor.getValue();
                 const parsed  = parseNote(content);
                 if (totalActiveItems(parsed) < 2) {
-                    new obsidian.Notice('Ordinal Ranking: need at least 2 list items to compare.');
+                    new obsidian.Notice('Drake\'s Factotum: need at least 2 list items to compare.');
                     return;
                 }
                 new RankSessionModal(this.app, parsed, (result) => {
                     applyResult(editor, content, result);
-                    new obsidian.Notice('Ordinal Ranking: rankings saved ✓');
+                    new obsidian.Notice('Drake\'s Factotum: rankings saved ✓');
                 }).open();
             }
         });
@@ -634,7 +634,7 @@ class OrdinalRankingPlugin extends obsidian.Plugin {
                 const parsed  = parseNote(content);
                 new AddItemModal(this.app, parsed, (result) => {
                     applyResult(editor, content, result);
-                    new obsidian.Notice('Ordinal Ranking: item added ✓');
+                    new obsidian.Notice('Drake\'s Factotum: item added ✓');
                 }).open();
             }
         });
@@ -646,26 +646,26 @@ class OrdinalRankingPlugin extends obsidian.Plugin {
                 const content = editor.getValue();
                 const parsed  = parseNote(content);
                 if (parsed.mode === 'matrix') {
-                    new obsidian.Notice('Ordinal Ranking: this note is already in matrix mode.');
+                    new obsidian.Notice('Drake\'s Factotum: this note is already in matrix mode.');
                     return;
                 }
                 if (parsed.items.length === 0) {
-                    new obsidian.Notice('Ordinal Ranking: no items to classify.');
+                    new obsidian.Notice('Drake\'s Factotum: no items to classify.');
                     return;
                 }
                 new ConvertModal(this.app, parsed, (result) => {
                     applyResult(editor, content, result);
-                    new obsidian.Notice('Ordinal Ranking: converted to Eisenhower matrix ✓');
+                    new obsidian.Notice('Drake\'s Factotum: converted to Eisenhower matrix ✓');
                 }).open();
             }
         });
 
-        console.log('Ordinal Ranking loaded');
+        console.log('Drake\'s Factotum loaded');
     }
 
     onunload() {
-        console.log('Ordinal Ranking unloaded');
+        console.log('Drake\'s Factotum unloaded');
     }
 }
 
-module.exports = OrdinalRankingPlugin;
+module.exports = DrakeFactotumPlugin;

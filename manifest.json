@@ -1,10 +1,10 @@
 {
-  "id": "ordinal-ranking",
-  "name": "Ordinal Ranking",
+  "id": "drake-factotum",
+  "name": "Drake's Factotum",
   "version": "1.0.0",
   "minAppVersion": "0.15.0",
-  "description": "Rank your markdown lists by pairwise comparison. Run a session to sort the list, or insert new items via binary-search placement.",
-  "author": "You",
+  "description": "A handy multi-tool for markdown lists: rank by pairwise comparison, insert items via binary-search placement, or sort into an Eisenhower matrix.",
+  "author": "Drake Morrison",
   "authorUrl": "",
   "isDesktopOnly": false
 }
