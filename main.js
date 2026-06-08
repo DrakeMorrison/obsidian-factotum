@@ -623,6 +623,7 @@ const DEFAULT_SETTINGS = {
         apiKey: '',
         model: 'claude-opus-4-8',
         folder: 'Weekly Reviews',
+        headerEmbed: '![[goals#goals]]', // inserted above the summary; blank to omit
         lastReviewWeekstamp: '',   // GGGG-[W]WW of the last created review
     },
 };
@@ -698,12 +699,12 @@ async function submitToBeeminder(s, value, daystamp, comment) {
 
 // ── Weekly review ───────────────────────────────────────────────────────────
 
-// Collect the text of unchecked `- [ ]` tasks from a note (same bullet/task
-// shapes parseNote recognises).
+// Collect the text of unchecked `- [ ]` tasks from a note, including indented /
+// nested tasks (leading whitespace and a tab or space after the bullet).
 function extractOpenTasks(text) {
     const tasks = [];
     for (const line of (text || '').split('\n')) {
-        const bullet = line.match(/^[-*+] (.+)$/);
+        const bullet = line.match(/^\s*[-*+]\s+(.+)$/);
         if (!bullet) continue;
         const open = bullet[1].trim().match(/^\[ \]\s+(.+)$/);
         if (open) tasks.push(open[1].trim());
@@ -842,12 +843,17 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         }
     }
 
+    // The next 11PM (today's, before it passes; otherwise still today's instant).
+    nextBeeminderDeadline() {
+        return obsidian.moment().hour(23).minute(0).second(0).millisecond(0);
+    }
+
     // (Re)arm a timer that fires at the next 11PM, submits, then re-arms itself.
     scheduleBeeminderSubmission() {
         this.clearBeeminderTimer();
         if (!this.settings.beeminder.enabled) return;
         const now = obsidian.moment();
-        const next = obsidian.moment().hour(23).minute(0).second(0).millisecond(0);
+        const next = this.nextBeeminderDeadline();
         if (next.isSameOrBefore(now)) next.add(1, 'day');
         this.beeminderTimer = window.setTimeout(async () => {
             await this.runBeeminderSubmission('scheduled 11PM');
@@ -861,7 +867,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     async maybeCatchUpBeeminder() {
         if (!this.settings.beeminder.enabled) return;
         const now = obsidian.moment();
-        const deadline = obsidian.moment().hour(23).minute(0).second(0).millisecond(0);
+        const deadline = this.nextBeeminderDeadline();
         if (deadline.isAfter(now)) deadline.subtract(1, 'day');
         if (this.settings.beeminder.lastSubmittedDaystamp !== deadline.format('YYYYMMDD')) {
             await this.runBeeminderSubmission('catch-up on open', deadline);
@@ -923,8 +929,14 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const now = obsidian.moment();
         const next = this.nextWeeklyDeadline();
         if (next.isSameOrBefore(now)) next.add(1, 'week');
+        // Capture the target Sunday so a late-firing timer (e.g. after a
+        // sleep/wake across midnight) still reviews the right week rather than
+        // letting isoWeekday(7) roll forward to the next week.
+        const target = next.clone();
         this.weeklyTimer = window.setTimeout(async () => {
-            await this.generateWeeklyReview('scheduled Sunday 11:55PM');
+            if (this.settings.weeklyReview.lastReviewWeekstamp !== target.format('GGGG-[W]WW')) {
+                await this.generateWeeklyReview('scheduled Sunday 11:55PM', target);
+            }
             this.scheduleWeeklyReview();
         }, next.diff(now));
     }
@@ -955,7 +967,10 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             return;
         }
 
-        const day = sundayMoment || obsidian.moment();
+        // Anchor to the ISO week's Sunday (its last day) so weekDates() and the
+        // weekstamp stay aligned. Scheduled/catch-up runs pass a Sunday already;
+        // manual runs fall back to the current week's Sunday.
+        const day = sundayMoment || obsidian.moment().isoWeekday(7);
         const weekstamp = day.format('GGGG-[W]WW');
         const dates = weekDates(day);
 
@@ -971,9 +986,10 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         }
 
         if (sections.length === 0) {
+            // Don't stamp the week as done — notes may just not be available yet
+            // (vault still indexing, or sync lag from another device). Leaving the
+            // stamp unset lets a later open re-scan and review once notes arrive.
             if (notify) new obsidian.Notice(`Drake's Factotum: no daily notes found for ${weekstamp}.`);
-            s.lastReviewWeekstamp = weekstamp;
-            await this.saveSettings();
             return;
         }
 
@@ -996,16 +1012,27 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             console.error('Drake\'s Factotum — Claude API error', result.status);
             return;
         }
+        const reviewBody = result.text.trim();
+        if (!reviewBody) {
+            // Empty/non-text response — don't write a hollow note or stamp the week.
+            new obsidian.Notice('Drake\'s Factotum: Claude returned an empty response; no review written.');
+            console.error('Drake\'s Factotum — empty Claude response');
+            return;
+        }
 
         const generated = obsidian.moment().format('YYYY-MM-DD HH:mm');
-        const note = `---\nweek: ${weekstamp}\nrange: ${dates[0].format('YYYY-MM-DD')} to ${dates[6].format('YYYY-MM-DD')}\ngenerated: ${generated}\n---\n\n# Weekly Review — ${weekstamp}\n\n![[goals#goals]]\n\n${result.text.trim()}\n`;
+        const embed = s.headerEmbed ? `${s.headerEmbed}\n\n` : '';
+        const note = `---\nweek: ${weekstamp}\nrange: ${dates[0].format('YYYY-MM-DD')} to ${dates[6].format('YYYY-MM-DD')}\ngenerated: ${generated}\n---\n\n# Weekly Review — ${weekstamp}\n\n${embed}${reviewBody}\n`;
 
         try {
             const file = await this.writeReviewNote(s.folder, weekstamp, note);
             s.lastReviewWeekstamp = weekstamp;
             await this.saveSettings();
             new obsidian.Notice(`Drake's Factotum: weekly review for ${weekstamp} saved ✓`);
-            if (notify && file) this.app.workspace.getLeaf(true).openFile(file);
+            if (notify && file) {
+                this.app.workspace.getLeaf(true).openFile(file)
+                    .catch(e => console.error('Drake\'s Factotum — could not open review note', e));
+            }
         } catch (e) {
             new obsidian.Notice('Drake\'s Factotum: could not write the weekly review note.');
             console.error('Drake\'s Factotum — weekly review write failed', e);
@@ -1015,7 +1042,8 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     async writeReviewNote(folder, weekstamp, content) {
         const dir = (folder || '').replace(/\/+$/, '');
         if (dir && !this.app.vault.getAbstractFileByPath(dir)) {
-            await this.app.vault.createFolder(dir);
+            // createFolder throws if it already exists — tolerate the race.
+            try { await this.app.vault.createFolder(dir); } catch (e) { /* already exists */ }
         }
         const path = obsidian.normalizePath(dir ? `${dir}/${weekstamp}.md` : `${weekstamp}.md`);
         const existing = this.app.vault.getAbstractFileByPath(path);
@@ -1023,7 +1051,17 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             await this.app.vault.modify(existing, content);
             return existing;
         }
-        return this.app.vault.create(path, content);
+        try {
+            return await this.app.vault.create(path, content);
+        } catch (e) {
+            // Lost a create race (file appeared between the check and create) — modify instead.
+            const f = this.app.vault.getAbstractFileByPath(path);
+            if (f instanceof obsidian.TFile) {
+                await this.app.vault.modify(f, content);
+                return f;
+            }
+            throw e;
+        }
     }
 }
 
@@ -1105,7 +1143,7 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
             .setHeading();
 
         containerEl.createEl('p', {
-            text: 'Just before midnight each Sunday, summarize the past week\'s daily notes with Claude and write a review note (with a list of potential TODOs) to your chosen folder. Catches up on next open if the app was closed at the time. The summary uses the Anthropic API (a few cents per week).',
+            text: 'Just before midnight each Sunday, summarize the past week\'s daily notes with Claude and write a review note (with a list of potential TODOs) to your chosen folder. If the app was closed at the time — including on mobile, where it runs when you next open Obsidian — it catches up on the next open. The summary uses the Anthropic API (a few cents per week).',
             cls: 'ordinal-hint',
         });
 
@@ -1145,6 +1183,14 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
                 .setPlaceholder('Weekly Reviews')
                 .setValue(w.folder)
                 .onChange(async (v) => { w.folder = v.trim(); await this.plugin.saveSettings(); }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Header embed (optional)')
+            .setDesc('Inserted at the top of every review, above the summary. Defaults to an embed of your goals note. Leave blank to omit.')
+            .addText(t => t
+                .setPlaceholder('![[goals#goals]]')
+                .setValue(w.headerEmbed)
+                .onChange(async (v) => { w.headerEmbed = v.trim(); await this.plugin.saveSettings(); }));
 
         new obsidian.Setting(containerEl)
             .setName('Generate this week\'s review now')

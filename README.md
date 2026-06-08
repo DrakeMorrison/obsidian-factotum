@@ -76,8 +76,9 @@ Enable it in **Settings → Drake's Factotum** and fill in:
 - **Anthropic API key** — from [console.anthropic.com](https://console.anthropic.com)
 - **Model** — defaults to `claude-opus-4-8` (any Anthropic model id works)
 - **Review folder** — defaults to `Weekly Reviews`
+- **Header embed** (optional) — inserted at the top of every review, above the summary. Defaults to `![[goals#goals]]` (an embed of your goals note); blank to omit.
 
-The note is saved as `Weekly Reviews/<ISO-week>.md` (e.g. `Weekly Reviews/2026-W23.md`), created and named automatically. Daily notes are located from your **Daily Notes** or **Periodic Notes** settings. If Obsidian was closed at the scheduled time, it catches up on the next launch for the most recent Sunday that wasn't yet generated. Re-running overwrites that week's note rather than duplicating it. Use **Generate now** in settings to test your setup.
+The note is saved as `Weekly Reviews/<ISO-week>.md` (e.g. `Weekly Reviews/2026-W23.md`), created and named automatically. Daily notes are located from your **Daily Notes** or **Periodic Notes** settings. If Obsidian was closed at the scheduled time (including on mobile, where background timers don't fire), it catches up on the next launch for the most recent Sunday that wasn't yet generated. Re-running overwrites that week's note rather than duplicating it. Use **Generate now** in settings to test your setup.
 
 > Each run makes one Claude API call (typically a few cents). The API key is stored locally in the plugin's `data.json`.
 
