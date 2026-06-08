@@ -998,7 +998,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         }
 
         const generated = obsidian.moment().format('YYYY-MM-DD HH:mm');
-        const note = `---\nweek: ${weekstamp}\nrange: ${dates[0].format('YYYY-MM-DD')} to ${dates[6].format('YYYY-MM-DD')}\ngenerated: ${generated}\n---\n\n# Weekly Review — ${weekstamp}\n\n${result.text.trim()}\n`;
+        const note = `---\nweek: ${weekstamp}\nrange: ${dates[0].format('YYYY-MM-DD')} to ${dates[6].format('YYYY-MM-DD')}\ngenerated: ${generated}\n---\n\n# Weekly Review — ${weekstamp}\n\n![[goals#goals]]\n\n${result.text.trim()}\n`;
 
         try {
             const file = await this.writeReviewNote(s.folder, weekstamp, note);
