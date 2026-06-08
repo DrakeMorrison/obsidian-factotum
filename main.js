@@ -618,6 +618,13 @@ const DEFAULT_SETTINGS = {
         templatePath: '',          // optional override; blank = auto-detect
         lastSubmittedDaystamp: '', // YYYYMMDD of the last successful send
     },
+    weeklyReview: {
+        enabled: false,
+        apiKey: '',
+        model: 'claude-opus-4-8',
+        folder: 'Weekly Reviews',
+        lastReviewWeekstamp: '',   // GGGG-[W]WW of the last created review
+    },
 };
 
 function stripFrontmatter(text) {
@@ -689,14 +696,72 @@ async function submitToBeeminder(s, value, daystamp, comment) {
     });
 }
 
+// ── Weekly review ───────────────────────────────────────────────────────────
+
+// Collect the text of unchecked `- [ ]` tasks from a note (same bullet/task
+// shapes parseNote recognises).
+function extractOpenTasks(text) {
+    const tasks = [];
+    for (const line of (text || '').split('\n')) {
+        const bullet = line.match(/^[-*+] (.+)$/);
+        if (!bullet) continue;
+        const open = bullet[1].trim().match(/^\[ \]\s+(.+)$/);
+        if (open) tasks.push(open[1].trim());
+    }
+    return tasks;
+}
+
+// The 7 dates (Mon→Sun) of the ISO week whose Sunday is `sundayMoment`.
+function weekDates(sundayMoment) {
+    const dates = [];
+    for (let i = 6; i >= 0; i--) dates.push(sundayMoment.clone().subtract(i, 'day'));
+    return dates;
+}
+
+async function callClaude(apiKey, model, system, userContent) {
+    const res = await obsidian.requestUrl({
+        url: 'https://api.anthropic.com/v1/messages',
+        method: 'POST',
+        contentType: 'application/json',
+        headers: {
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+            model,
+            max_tokens: 8000,
+            system,
+            messages: [{ role: 'user', content: userContent }],
+        }),
+        throw: false,
+    });
+    if (res.status < 200 || res.status >= 300) {
+        return { ok: false, status: res.status, text: '' };
+    }
+    const block = (res.json?.content || []).find(b => b.type === 'text');
+    return { ok: true, status: res.status, text: block ? block.text : '' };
+}
+
+const WEEKLY_REVIEW_SYSTEM =
+    'You are writing a weekly review from a user\'s Obsidian daily notes. ' +
+    'Output GitHub-flavored markdown with exactly two sections and nothing else. ' +
+    'First, `## Summary` — a concise prose recap of the week\'s themes, progress, and notable events. ' +
+    'Then, `## Potential TODOs` — a `- [ ]` checkbox list. ' +
+    'The TODO list must include every still-open task provided to you, plus any additional action items ' +
+    'you can reasonably infer from the notes. De-duplicate overlapping items. ' +
+    'Do not invent events that are not supported by the notes.';
+
 class DrakeFactotumPlugin extends obsidian.Plugin {
     async onload() {
         await this.loadSettings();
         this.addSettingTab(new FactotumSettingTab(this.app, this));
         this.beeminderTimer = null;
+        this.weeklyTimer = null;
         this.app.workspace.onLayoutReady(() => {
             this.maybeCatchUpBeeminder();
             this.scheduleBeeminderSubmission();
+            this.maybeCatchUpWeeklyReview();
+            this.scheduleWeeklyReview();
         });
 
         this.addCommand({
@@ -755,6 +820,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
 
     onunload() {
         this.clearBeeminderTimer();
+        this.clearWeeklyTimer();
         console.log('Drake\'s Factotum unloaded');
     }
 
@@ -762,6 +828,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const data = await this.loadData();
         this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
         this.settings.beeminder = Object.assign({}, DEFAULT_SETTINGS.beeminder, data?.beeminder);
+        this.settings.weeklyReview = Object.assign({}, DEFAULT_SETTINGS.weeklyReview, data?.weeklyReview);
     }
 
     async saveSettings() {
@@ -836,6 +903,128 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             console.error('Drake\'s Factotum — Beeminder request failed', e);
         }
     }
+
+    clearWeeklyTimer() {
+        if (this.weeklyTimer !== null) {
+            window.clearTimeout(this.weeklyTimer);
+            this.weeklyTimer = null;
+        }
+    }
+
+    // The next Sunday 23:55 (just before midnight).
+    nextWeeklyDeadline() {
+        return obsidian.moment().isoWeekday(7).hour(23).minute(55).second(0).millisecond(0);
+    }
+
+    // (Re)arm a timer that fires at the next Sunday 23:55, generates, then re-arms.
+    scheduleWeeklyReview() {
+        this.clearWeeklyTimer();
+        if (!this.settings.weeklyReview.enabled) return;
+        const now = obsidian.moment();
+        const next = this.nextWeeklyDeadline();
+        if (next.isSameOrBefore(now)) next.add(1, 'week');
+        this.weeklyTimer = window.setTimeout(async () => {
+            await this.generateWeeklyReview('scheduled Sunday 11:55PM');
+            this.scheduleWeeklyReview();
+        }, next.diff(now));
+    }
+
+    // If a Sunday-night run was missed (Obsidian closed at the time), catch up on
+    // open by generating for the most recent Sunday deadline that has passed —
+    // which is last Sunday if it's currently before this Sunday's 11:55PM.
+    async maybeCatchUpWeeklyReview() {
+        if (!this.settings.weeklyReview.enabled) return;
+        const now = obsidian.moment();
+        const deadline = this.nextWeeklyDeadline();
+        if (deadline.isAfter(now)) deadline.subtract(1, 'week');
+        if (this.settings.weeklyReview.lastReviewWeekstamp !== deadline.format('GGGG-[W]WW')) {
+            await this.generateWeeklyReview('catch-up on open', deadline);
+        }
+    }
+
+    async generateWeeklyReview(reason, sundayMoment = null, notify = false) {
+        const s = this.settings.weeklyReview;
+        if (!s.enabled) return;
+        if (!s.apiKey) {
+            if (notify) new obsidian.Notice('Drake\'s Factotum: weekly review needs an Anthropic API key.');
+            return;
+        }
+        const config = getDailyNoteConfig(this.app);
+        if (!config) {
+            new obsidian.Notice('Drake\'s Factotum: could not find a Daily Notes / Periodic Notes config.');
+            return;
+        }
+
+        const day = sundayMoment || obsidian.moment();
+        const weekstamp = day.format('GGGG-[W]WW');
+        const dates = weekDates(day);
+
+        const sections = [];
+        const openTasks = [];
+        for (const d of dates) {
+            const file = this.app.vault.getAbstractFileByPath(dailyNotePath(config, d));
+            if (!(file instanceof obsidian.TFile)) continue;
+            const body = stripFrontmatter(await this.app.vault.cachedRead(file)).trim();
+            if (!body) continue;
+            sections.push(`### ${d.format('dddd, YYYY-MM-DD')}\n${body}`);
+            openTasks.push(...extractOpenTasks(body));
+        }
+
+        if (sections.length === 0) {
+            if (notify) new obsidian.Notice(`Drake's Factotum: no daily notes found for ${weekstamp}.`);
+            s.lastReviewWeekstamp = weekstamp;
+            await this.saveSettings();
+            return;
+        }
+
+        const taskBlock = openTasks.length
+            ? `Still-open tasks (include all of these):\n${openTasks.map(t => `- [ ] ${t}`).join('\n')}`
+            : 'Still-open tasks: (none found)';
+        const userContent = `Daily notes for the week of ${weekstamp} (${dates[0].format('YYYY-MM-DD')} to ${dates[6].format('YYYY-MM-DD')}):\n\n${sections.join('\n\n')}\n\n${taskBlock}`;
+
+        new obsidian.Notice(`Drake's Factotum: generating weekly review for ${weekstamp}…`);
+        let result;
+        try {
+            result = await callClaude(s.apiKey, s.model, WEEKLY_REVIEW_SYSTEM, userContent);
+        } catch (e) {
+            new obsidian.Notice('Drake\'s Factotum: weekly review request failed (network error).');
+            console.error('Drake\'s Factotum — Claude request failed', e);
+            return;
+        }
+        if (!result.ok) {
+            new obsidian.Notice(`Drake's Factotum: Claude API error (HTTP ${result.status}).`);
+            console.error('Drake\'s Factotum — Claude API error', result.status);
+            return;
+        }
+
+        const generated = obsidian.moment().format('YYYY-MM-DD HH:mm');
+        const note = `---\nweek: ${weekstamp}\nrange: ${dates[0].format('YYYY-MM-DD')} to ${dates[6].format('YYYY-MM-DD')}\ngenerated: ${generated}\n---\n\n# Weekly Review — ${weekstamp}\n\n${result.text.trim()}\n`;
+
+        try {
+            const file = await this.writeReviewNote(s.folder, weekstamp, note);
+            s.lastReviewWeekstamp = weekstamp;
+            await this.saveSettings();
+            new obsidian.Notice(`Drake's Factotum: weekly review for ${weekstamp} saved ✓`);
+            if (notify && file) this.app.workspace.getLeaf(true).openFile(file);
+        } catch (e) {
+            new obsidian.Notice('Drake\'s Factotum: could not write the weekly review note.');
+            console.error('Drake\'s Factotum — weekly review write failed', e);
+        }
+    }
+
+    async writeReviewNote(folder, weekstamp, content) {
+        const dir = (folder || '').replace(/\/+$/, '');
+        if (dir && !this.app.vault.getAbstractFileByPath(dir)) {
+            await this.app.vault.createFolder(dir);
+        }
+        const path = obsidian.normalizePath(dir ? `${dir}/${weekstamp}.md` : `${weekstamp}.md`);
+        const existing = this.app.vault.getAbstractFileByPath(path);
+        if (existing instanceof obsidian.TFile) {
+            await this.app.vault.modify(existing, content);
+            return existing;
+        }
+        return this.app.vault.create(path, content);
+    }
 }
 
 class FactotumSettingTab extends obsidian.PluginSettingTab {
@@ -908,6 +1097,61 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
             .addButton(btn => btn
                 .setButtonText('Send now')
                 .onClick(() => this.plugin.runBeeminderSubmission('manual send', null, true)));
+
+        const w = this.plugin.settings.weeklyReview;
+
+        new obsidian.Setting(containerEl)
+            .setName('Weekly review')
+            .setHeading();
+
+        containerEl.createEl('p', {
+            text: 'Just before midnight each Sunday, summarize the past week\'s daily notes with Claude and write a review note (with a list of potential TODOs) to your chosen folder. Catches up on next open if the app was closed at the time. The summary uses the Anthropic API (a few cents per week).',
+            cls: 'ordinal-hint',
+        });
+
+        new obsidian.Setting(containerEl)
+            .setName('Enable weekly review')
+            .setDesc('Generate automatically Sunday at 11:55PM, with catch-up on startup.')
+            .addToggle(t => t
+                .setValue(w.enabled)
+                .onChange(async (v) => {
+                    w.enabled = v;
+                    await this.plugin.saveSettings();
+                    this.plugin.scheduleWeeklyReview();
+                }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Anthropic API key')
+            .setDesc('From console.anthropic.com. Stored locally in this plugin\'s data.json.')
+            .addText(t => {
+                t.setPlaceholder('sk-ant-...')
+                    .setValue(w.apiKey)
+                    .onChange(async (v) => { w.apiKey = v.trim(); await this.plugin.saveSettings(); });
+                t.inputEl.type = 'password';
+            });
+
+        new obsidian.Setting(containerEl)
+            .setName('Model')
+            .setDesc('Anthropic model id, e.g. claude-opus-4-8 or claude-sonnet-4-6.')
+            .addText(t => t
+                .setPlaceholder('claude-opus-4-8')
+                .setValue(w.model)
+                .onChange(async (v) => { w.model = v.trim(); await this.plugin.saveSettings(); }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Review folder')
+            .setDesc('Where review notes are saved (named by ISO week, e.g. 2026-W23.md). Created if missing.')
+            .addText(t => t
+                .setPlaceholder('Weekly Reviews')
+                .setValue(w.folder)
+                .onChange(async (v) => { w.folder = v.trim(); await this.plugin.saveSettings(); }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Generate this week\'s review now')
+            .setDesc('Build the review immediately to test your configuration.')
+            .addButton(btn => btn
+                .setButtonText('Generate now')
+                .onClick(() => this.plugin.generateWeeklyReview('manual', null, true)));
     }
 }
 

@@ -64,6 +64,23 @@ Each night it counts the words in today's daily note, **subtracts the word count
 
 If Obsidian wasn't open at 11PM, it catches up the next time you launch (provided it's still past 11PM and that day hasn't been sent yet). Re-sends for the same day update the datapoint rather than duplicating it. Use **Send now** in settings to test your setup.
 
+### Weekly review note
+
+Optionally, the plugin can generate a **weekly review note** just before midnight every **Sunday** (11:55PM). It reads the past week's daily notes (Monday–Sunday) and uses the [Anthropic Claude API](https://www.anthropic.com) to write:
+
+- a prose **`## Summary`** of the week, and
+- a **`## Potential TODOs`** checkbox list — every still-open `- [ ]` task from the week, plus action items inferred from your notes.
+
+Enable it in **Settings → Drake's Factotum** and fill in:
+
+- **Anthropic API key** — from [console.anthropic.com](https://console.anthropic.com)
+- **Model** — defaults to `claude-opus-4-8` (any Anthropic model id works)
+- **Review folder** — defaults to `Weekly Reviews`
+
+The note is saved as `Weekly Reviews/<ISO-week>.md` (e.g. `Weekly Reviews/2026-W23.md`), created and named automatically. Daily notes are located from your **Daily Notes** or **Periodic Notes** settings. If Obsidian was closed at the scheduled time, it catches up on the next launch for the most recent Sunday that wasn't yet generated. Re-running overwrites that week's note rather than duplicating it. Use **Generate now** in settings to test your setup.
+
+> Each run makes one Claude API call (typically a few cents). The API key is stored locally in the plugin's `data.json`.
+
 ---
 
 ## How your note looks after ranking
