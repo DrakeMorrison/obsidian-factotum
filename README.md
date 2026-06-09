@@ -47,6 +47,8 @@ If you can't decide between two items, hit **Skip** — the current relative ord
 
 Type your new item, then answer ~log₂(n) comparisons to slot it in the right place. For a 100-item list that's ~7 questions.
 
+By default this works on the note you're currently viewing. To always add to one designated TODO note no matter which note is open, set a **TODO note path** in **Settings → Drake's Factotum** (e.g. `TODO.md`). The command then targets that note from anywhere — and stays available even when no note is open. Leave the path blank to keep the original "current note" behavior.
+
 ### Checked-off tasks
 
 Lines like `- [x] done thing` are skipped — they don't appear in comparisons and stay put when the list is rewritten. Active tasks (`- [ ] thing`) and plain bullets (`- thing`) are both ranked.

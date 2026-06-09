@@ -594,12 +594,15 @@ class ConvertModal extends obsidian.Modal {
 
 // ── Plugin ──────────────────────────────────────────────────────────────────
 
-function applyResult(editor, originalContent, result) {
+function computeResult(originalContent, result) {
     if (result.mode === 'flat') {
-        editor.setValue(serializeFlat(originalContent, result.items));
-    } else {
-        editor.setValue(serializeMatrix(originalContent, result.sections));
+        return serializeFlat(originalContent, result.items);
     }
+    return serializeMatrix(originalContent, result.sections);
+}
+
+function applyResult(editor, originalContent, result) {
+    editor.setValue(computeResult(originalContent, result));
 }
 
 function totalActiveItems(parsed) {
@@ -610,6 +613,7 @@ function totalActiveItems(parsed) {
 // ── Beeminder daily word count ──────────────────────────────────────────────
 
 const DEFAULT_SETTINGS = {
+    todoNotePath: '',               // note that "Add new item" targets; blank = active note
     beeminder: {
         enabled: false,
         authToken: '',
@@ -785,11 +789,30 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         this.addCommand({
             id: 'factotum-add-item',
             name: 'Add new item (binary-search placement)',
-            editorCallback: (editor) => {
-                const content = editor.getValue();
+            // Not an editorCallback: a configured TODO note is targeted no
+            // matter which note is active, so this command is always available.
+            callback: async () => {
+                const path = (this.settings.todoNotePath || '').trim();
+                let target;
+                if (path) {
+                    const file = this.resolveTodoNote();
+                    if (!file) {
+                        new obsidian.Notice(`Drake's Factotum: TODO note not found at "${path}". Check the path in settings.`);
+                        return;
+                    }
+                    target = this.fileTarget(file);
+                } else {
+                    const view = this.app.workspace.getActiveViewOfType(obsidian.MarkdownView);
+                    if (!view) {
+                        new obsidian.Notice('Drake\'s Factotum: open a note, or set a TODO note path in settings.');
+                        return;
+                    }
+                    target = { read: async () => view.editor.getValue(), write: async (c) => view.editor.setValue(c) };
+                }
+                const content = await target.read();
                 const parsed  = parseNote(content);
-                new AddItemModal(this.app, parsed, (result) => {
-                    applyResult(editor, content, result);
+                new AddItemModal(this.app, parsed, async (result) => {
+                    await target.write(computeResult(content, result));
                     new obsidian.Notice('Drake\'s Factotum: item added ✓');
                 }).open();
             }
@@ -834,6 +857,40 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
 
     async saveSettings() {
         await this.saveData(this.settings);
+    }
+
+    // Resolve the configured TODO note to a TFile, tolerating a missing ".md".
+    // Returns null if unset or the path doesn't point at a markdown file.
+    resolveTodoNote() {
+        const path = (this.settings.todoNotePath || '').trim();
+        if (!path) return null;
+        let file = this.app.vault.getAbstractFileByPath(path);
+        if (!file && !path.toLowerCase().endsWith('.md')) {
+            file = this.app.vault.getAbstractFileByPath(path + '.md');
+        }
+        return file instanceof obsidian.TFile ? file : null;
+    }
+
+    // The open editor for a file, if any leaf currently has it loaded.
+    findOpenEditor(file) {
+        for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
+            const view = leaf.view;
+            if (view instanceof obsidian.MarkdownView && view.file === file) return view.editor;
+        }
+        return null;
+    }
+
+    // A read/write handle for a file. If it's open in an editor, go through the
+    // editor so unsaved changes aren't clobbered; otherwise touch the file.
+    fileTarget(file) {
+        const editor = this.findOpenEditor(file);
+        if (editor) {
+            return { read: async () => editor.getValue(), write: async (c) => editor.setValue(c) };
+        }
+        return {
+            read: () => this.app.vault.read(file),
+            write: (c) => this.app.vault.modify(file, c),
+        };
     }
 
     clearBeeminderTimer() {
@@ -1074,6 +1131,19 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
     display() {
         const { containerEl } = this;
         containerEl.empty();
+
+        new obsidian.Setting(containerEl)
+            .setName('TODO list')
+            .setHeading();
+
+        new obsidian.Setting(containerEl)
+            .setName('TODO note path')
+            .setDesc('"Add new item" always targets this note, regardless of which note is active. Leave blank to add to the currently open note instead.')
+            .addText(t => t
+                .setPlaceholder('TODO.md')
+                .setValue(this.plugin.settings.todoNotePath)
+                .onChange(async (v) => { this.plugin.settings.todoNotePath = v.trim(); await this.plugin.saveSettings(); }));
+
         const b = this.plugin.settings.beeminder;
 
         new obsidian.Setting(containerEl)
