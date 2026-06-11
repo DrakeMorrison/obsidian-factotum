@@ -974,40 +974,45 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         }
     }
 
-    // The next Sunday 23:55 (just before midnight).
+    // The instant the current ISO week closes: next Monday at 00:00. Reviewing at
+    // the start of the new week (rather than Sunday night) captures everything
+    // written late on Sunday.
     nextWeeklyDeadline() {
-        return obsidian.moment().isoWeekday(7).hour(23).minute(55).second(0).millisecond(0);
+        return obsidian.moment().startOf('isoWeek').add(1, 'week');
     }
 
-    // (Re)arm a timer that fires at the next Sunday 23:55, generates, then re-arms.
+    // (Re)arm a timer that fires when the week closes (Monday 00:00), reviews the
+    // week that just ended, then re-arms.
     scheduleWeeklyReview() {
         this.clearWeeklyTimer();
         if (!this.settings.weeklyReview.enabled) return;
         const now = obsidian.moment();
         const next = this.nextWeeklyDeadline();
         if (next.isSameOrBefore(now)) next.add(1, 'week');
-        // Capture the target Sunday so a late-firing timer (e.g. after a
-        // sleep/wake across midnight) still reviews the right week rather than
-        // letting isoWeekday(7) roll forward to the next week.
-        const target = next.clone();
+        // The week to review is the one that just closed; its Sunday is the day
+        // before this Monday-00:00 boundary. Capture it so a late-firing timer
+        // (e.g. after a sleep/wake) still reviews that week rather than rolling
+        // forward into the new one.
+        const target = next.clone().subtract(1, 'day');
         this.weeklyTimer = window.setTimeout(async () => {
             if (this.settings.weeklyReview.lastReviewWeekstamp !== target.format('GGGG-[W]WW')) {
-                await this.generateWeeklyReview('scheduled Sunday 11:55PM', target);
+                await this.generateWeeklyReview('scheduled Monday 12AM', target);
             }
             this.scheduleWeeklyReview();
         }, next.diff(now));
     }
 
-    // If a Sunday-night run was missed (Obsidian closed at the time), catch up on
-    // open by generating for the most recent Sunday deadline that has passed —
-    // which is last Sunday if it's currently before this Sunday's 11:55PM.
+    // If a week-close run was missed (Obsidian closed at the boundary), catch up
+    // on open by generating for the most recent week that has already closed.
     async maybeCatchUpWeeklyReview() {
         if (!this.settings.weeklyReview.enabled) return;
         const now = obsidian.moment();
         const deadline = this.nextWeeklyDeadline();
         if (deadline.isAfter(now)) deadline.subtract(1, 'week');
-        if (this.settings.weeklyReview.lastReviewWeekstamp !== deadline.format('GGGG-[W]WW')) {
-            await this.generateWeeklyReview('catch-up on open', deadline);
+        // The just-closed week's Sunday is the day before that Monday-00:00 boundary.
+        const target = deadline.clone().subtract(1, 'day');
+        if (this.settings.weeklyReview.lastReviewWeekstamp !== target.format('GGGG-[W]WW')) {
+            await this.generateWeeklyReview('catch-up on open', target);
         }
     }
 
@@ -1219,7 +1224,7 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
 
         new obsidian.Setting(containerEl)
             .setName('Enable weekly review')
-            .setDesc('Generate automatically Sunday at 11:55PM, with catch-up on startup.')
+            .setDesc('Generate automatically at the start of each week (just after Sunday midnight), with catch-up on startup.')
             .addToggle(t => t
                 .setValue(w.enabled)
                 .onChange(async (v) => {

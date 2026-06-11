@@ -68,7 +68,7 @@ If Obsidian wasn't open at 11PM, it catches up the next time you launch (provide
 
 ### Weekly review note
 
-Optionally, the plugin can generate a **weekly review note** just before midnight every **Sunday** (11:55PM). It reads the past week's daily notes (Monday–Sunday) and uses the [Anthropic Claude API](https://www.anthropic.com) to write:
+Optionally, the plugin can generate a **weekly review note** at the start of each week (just after **Sunday** midnight, i.e. early **Monday**). It reads the just-finished week's daily notes (Monday–Sunday) and uses the [Anthropic Claude API](https://www.anthropic.com) to write:
 
 - a prose **`## Summary`** of the week, and
 - a **`## Potential TODOs`** checkbox list — every still-open `- [ ]` task from the week, plus action items inferred from your notes.
