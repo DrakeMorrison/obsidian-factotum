@@ -912,8 +912,9 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const now = obsidian.moment();
         const next = this.nextBeeminderDeadline();
         if (next.isSameOrBefore(now)) next.add(1, 'day');
+        const deadline = next.clone();
         this.beeminderTimer = window.setTimeout(async () => {
-            await this.runBeeminderSubmission('scheduled 11PM');
+            await this.runBeeminderSubmission('scheduled 11PM', deadline);
             this.scheduleBeeminderSubmission();
         }, next.diff(now));
     }
