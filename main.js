@@ -628,6 +628,7 @@ const DEFAULT_SETTINGS = {
         model: 'claude-opus-4-8',
         folder: 'Weekly Reviews',
         headerEmbed: '![[goals#goals]]', // inserted above the summary; blank to omit
+        goalsSource: '![[goals#goals]]', // section read so Claude can pose a review question per goal; blank to omit
         lastReviewWeekstamp: '',   // GGGG-[W]WW of the last created review
     },
 };
@@ -716,6 +717,43 @@ function extractOpenTasks(text) {
     return tasks;
 }
 
+// Return the body under the markdown heading whose text matches `heading`
+// (case-insensitive), up to the next heading of the same or higher level.
+function extractSection(content, heading) {
+    const lines = content.split('\n');
+    const want = heading.toLowerCase();
+    let start = -1, level = 0;
+    for (let i = 0; i < lines.length; i++) {
+        const h = lines[i].match(/^(#{1,6})\s+(.+?)\s*$/);
+        if (h && h[2].trim().toLowerCase() === want) { start = i; level = h[1].length; break; }
+    }
+    if (start < 0) return '';
+    const out = [];
+    for (let i = start + 1; i < lines.length; i++) {
+        const h = lines[i].match(/^(#{1,6})\s+/);
+        if (h && h[1].length <= level) break;
+        out.push(lines[i]);
+    }
+    return out.join('\n').trim();
+}
+
+// Pull the plain text of the note/section referenced by a wiki embed like
+// `![[goals#goals]]`, so Claude can read the goals rather than only embed them
+// visually. Returns '' if the link is blank, unparseable, or unresolved.
+async function readEmbeddedSection(app, embed) {
+    const m = (embed || '').match(/\[\[([^\]]+)\]\]/);
+    if (!m) return '';
+    const target = m[1].split('|')[0].trim();          // drop any display alias
+    const hashIdx = target.indexOf('#');
+    const linkpath = (hashIdx >= 0 ? target.slice(0, hashIdx) : target).trim();
+    const heading = (hashIdx >= 0 ? target.slice(hashIdx + 1) : '').replace(/^#+/, '').trim();
+    if (!linkpath) return '';
+    const file = app.metadataCache.getFirstLinkpathDest(linkpath, '');
+    if (!(file instanceof obsidian.TFile)) return '';
+    const content = await app.vault.cachedRead(file);
+    return heading ? extractSection(content, heading) : stripFrontmatter(content).trim();
+}
+
 // The 7 dates (Mon→Sun) of the ISO week whose Sunday is `sundayMoment`.
 function weekDates(sundayMoment) {
     const dates = [];
@@ -747,14 +785,24 @@ async function callClaude(apiKey, model, system, userContent) {
     return { ok: true, status: res.status, text: block ? block.text : '' };
 }
 
-const WEEKLY_REVIEW_SYSTEM =
-    'You are writing a weekly review from a user\'s Obsidian daily notes. ' +
-    'Output GitHub-flavored markdown with exactly two sections and nothing else. ' +
-    'First, `## Summary` — a concise prose recap of the week\'s themes, progress, and notable events. ' +
-    'Then, `## Potential TODOs` — a `- [ ]` checkbox list. ' +
-    'The TODO list must include every still-open task provided to you, plus any additional action items ' +
-    'you can reasonably infer from the notes. De-duplicate overlapping items. ' +
-    'Do not invent events that are not supported by the notes.';
+function weeklyReviewSystem(hasGoals) {
+    let s =
+        'You are writing a weekly review from a user\'s Obsidian daily notes. ' +
+        'Output GitHub-flavored markdown with the sections described below, in order, and nothing else. ' +
+        'First, `## AI Summary` — a concise prose recap of the week\'s themes, progress, and notable events. ' +
+        'Then, `## Potential TODOs` — a `- [ ]` checkbox list. ' +
+        'The TODO list must include every still-open task provided to you, plus any additional action items ' +
+        'you can reasonably infer from the notes. De-duplicate overlapping items. ';
+    if (hasGoals) {
+        s +=
+            'Finally, `## Review Questions` — a `-` bullet list with exactly one reflective question per goal ' +
+            'provided to you, in the same order as the goals. Each question should prompt the user to assess ' +
+            'their progress on that goal this week, grounded in what the notes show. One question per goal, ' +
+            'no more, no fewer. ';
+    }
+    s += 'Do not invent events that are not supported by the notes.';
+    return s;
+}
 
 class DrakeFactotumPlugin extends obsidian.Plugin {
     async onload() {
@@ -1059,12 +1107,17 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const taskBlock = openTasks.length
             ? `Still-open tasks (include all of these):\n${openTasks.map(t => `- [ ] ${t}`).join('\n')}`
             : 'Still-open tasks: (none found)';
-        const userContent = `Daily notes for the week of ${weekstamp} (${dates[0].format('YYYY-MM-DD')} to ${dates[6].format('YYYY-MM-DD')}):\n\n${sections.join('\n\n')}\n\n${taskBlock}`;
+        // Read the goals section so Claude can pose a review question per goal.
+        const goalsText = await readEmbeddedSection(this.app, s.goalsSource);
+        const goalsBlock = goalsText
+            ? `\n\nThe user's goals (write exactly one review question for each):\n${goalsText}`
+            : '';
+        const userContent = `Daily notes for the week of ${weekstamp} (${dates[0].format('YYYY-MM-DD')} to ${dates[6].format('YYYY-MM-DD')}):\n\n${sections.join('\n\n')}\n\n${taskBlock}${goalsBlock}`;
 
         new obsidian.Notice(`Drake's Factotum: generating weekly review for ${weekstamp}…`);
         let result;
         try {
-            result = await callClaude(s.apiKey, s.model, WEEKLY_REVIEW_SYSTEM, userContent);
+            result = await callClaude(s.apiKey, s.model, weeklyReviewSystem(!!goalsText), userContent);
         } catch (e) {
             new obsidian.Notice('Drake\'s Factotum: weekly review request failed (network error).');
             console.error('Drake\'s Factotum — Claude request failed', e);
@@ -1262,11 +1315,19 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
 
         new obsidian.Setting(containerEl)
             .setName('Header embed (optional)')
-            .setDesc('Inserted at the top of every review, above the summary. Defaults to an embed of your goals note. Leave blank to omit.')
+            .setDesc('Inserted at the top of every review, above the AI summary. Defaults to an embed of your goals note. Leave blank to omit.')
             .addText(t => t
                 .setPlaceholder('![[goals#goals]]')
                 .setValue(w.headerEmbed)
                 .onChange(async (v) => { w.headerEmbed = v.trim(); await this.plugin.saveSettings(); }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Goals source (optional)')
+            .setDesc('A wiki link like ![[goals#goals]] whose linked section is read so the review ends with one review question per goal. Leave blank to skip the review questions.')
+            .addText(t => t
+                .setPlaceholder('![[goals#goals]]')
+                .setValue(w.goalsSource)
+                .onChange(async (v) => { w.goalsSource = v.trim(); await this.plugin.saveSettings(); }));
 
         new obsidian.Setting(containerEl)
             .setName('Generate this week\'s review now')
