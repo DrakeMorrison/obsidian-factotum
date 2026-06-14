@@ -962,7 +962,16 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         if (next.isSameOrBefore(now)) next.add(1, 'day');
         const deadline = next.clone();
         this.beeminderTimer = window.setTimeout(async () => {
-            await this.runBeeminderSubmission('scheduled 11PM', deadline);
+            // Mobile (iOS) suspends timers while the app is backgrounded; on
+            // resume a pending setTimeout fires immediately rather than at its
+            // intended instant, so it can go off long before the deadline. Trust
+            // the wall clock, not the firing: only submit once we've actually
+            // reached the deadline, and never re-send a day already stamped.
+            // Otherwise just re-arm, which recomputes the correct remaining delay.
+            if (obsidian.moment().isSameOrAfter(deadline) &&
+                this.settings.beeminder.lastSubmittedDaystamp !== deadline.format('YYYYMMDD')) {
+                await this.runBeeminderSubmission('scheduled 11PM', deadline);
+            }
             this.scheduleBeeminderSubmission();
         }, next.diff(now));
     }
@@ -973,10 +982,19 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     async maybeCatchUpBeeminder() {
         if (!this.settings.beeminder.enabled) return;
         const now = obsidian.moment();
-        const deadline = this.nextBeeminderDeadline();
-        if (deadline.isAfter(now)) deadline.subtract(1, 'day');
-        if (this.settings.beeminder.lastSubmittedDaystamp !== deadline.format('YYYYMMDD')) {
-            await this.runBeeminderSubmission('catch-up on open', deadline);
+        // Most recent 11PM deadline that has already passed (yesterday's if it's
+        // currently before 11PM today).
+        const mostRecent = this.nextBeeminderDeadline();
+        if (mostRecent.isAfter(now)) mostRecent.subtract(1, 'day');
+        // Timers are unreliable on mobile and this runs only once per cold start,
+        // so a multi-day absence (phone away for a weekend) would otherwise lose
+        // every day but the last. Walk back a week and submit each day whose note
+        // exists; runBeeminderSubmission() skips days with no note (no clobber),
+        // and the stable per-day requestid makes re-sending an unchanged day a
+        // harmless overwrite — so this also self-heals notes that sync in late.
+        // Oldest-first so lastSubmittedDaystamp ends at the most recent day.
+        for (let i = 6; i >= 0; i--) {
+            await this.runBeeminderSubmission('catch-up on open', mostRecent.clone().subtract(i, 'day'));
         }
     }
 
@@ -989,11 +1007,25 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         }
         const config = getDailyNoteConfig(this.app);
         if (!config) {
-            new obsidian.Notice('Drake\'s Factotum: could not find a Daily Notes / Periodic Notes config.');
+            if (notify) new obsidian.Notice('Drake\'s Factotum: could not find a Daily Notes / Periodic Notes config.');
             return;
         }
         const day = targetMoment || obsidian.moment();
-        const noteWords = await readWordCount(this.app, dailyNotePath(config, day));
+        // On a phone the day's note may not have synced yet (or was never opened
+        // on this device). readWordCount() would report a missing file as 0, and
+        // because submitToBeeminder() uses a stable per-day requestid, sending 0
+        // OVERWRITES a real value another device already submitted for this day —
+        // silently destroying the count. Treat an absent note as "data not here
+        // yet": skip without stamping, so a later open or 11PM timer retries once
+        // the note arrives. (Mirrors the weekly review's empty-week guard.) A
+        // present-but-empty note is genuine 0 and still submits.
+        const notePath = dailyNotePath(config, day);
+        const noteFile = this.app.vault.getAbstractFileByPath(notePath);
+        if (!(noteFile instanceof obsidian.TFile)) {
+            if (notify) new obsidian.Notice(`Drake's Factotum: no daily note for ${day.format('YYYY-MM-DD')} yet — nothing sent.`);
+            return;
+        }
+        const noteWords = countWords(await this.app.vault.cachedRead(noteFile));
         const templatePath = resolveTemplatePath(s.templatePath || config.template);
         const templateWords = await readWordCount(this.app, templatePath);
         const value = Math.max(0, noteWords - templateWords);
@@ -1005,13 +1037,15 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             if (res.status >= 200 && res.status < 300) {
                 s.lastSubmittedDaystamp = daystamp;
                 await this.saveSettings();
-                new obsidian.Notice(`Drake's Factotum: sent ${value} words to Beeminder ✓`);
+                if (notify) new obsidian.Notice(`Drake's Factotum: sent ${value} words to Beeminder ✓`);
             } else {
-                new obsidian.Notice(`Drake's Factotum: Beeminder rejected the submission (HTTP ${res.status}).`);
+                // Background runs stay silent (they retry on the next open/timer);
+                // the console keeps the record. Manual "Send now" surfaces it.
+                if (notify) new obsidian.Notice(`Drake's Factotum: Beeminder rejected the submission (HTTP ${res.status}).`);
                 console.error('Drake\'s Factotum — Beeminder error', res.status, res.text);
             }
         } catch (e) {
-            new obsidian.Notice('Drake\'s Factotum: Beeminder submission failed (network error).');
+            if (notify) new obsidian.Notice('Drake\'s Factotum: Beeminder submission failed (network error).');
             console.error('Drake\'s Factotum — Beeminder request failed', e);
         }
     }
@@ -1044,7 +1078,12 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         // forward into the new one.
         const target = next.clone().subtract(1, 'day');
         this.weeklyTimer = window.setTimeout(async () => {
-            if (this.settings.weeklyReview.lastReviewWeekstamp !== target.format('GGGG-[W]WW')) {
+            // As with the Beeminder timer: a suspended mobile app fires pending
+            // timeouts on resume, before their instant. Only review once the week
+            // has actually closed (we've reached the Monday-00:00 boundary), and
+            // never re-review a week already stamped. Otherwise just re-arm.
+            if (obsidian.moment().isSameOrAfter(next) &&
+                this.settings.weeklyReview.lastReviewWeekstamp !== target.format('GGGG-[W]WW')) {
                 await this.generateWeeklyReview('scheduled Monday 12AM', target);
             }
             this.scheduleWeeklyReview();
@@ -1074,7 +1113,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         }
         const config = getDailyNoteConfig(this.app);
         if (!config) {
-            new obsidian.Notice('Drake\'s Factotum: could not find a Daily Notes / Periodic Notes config.');
+            if (notify) new obsidian.Notice('Drake\'s Factotum: could not find a Daily Notes / Periodic Notes config.');
             return;
         }
 
