@@ -667,6 +667,13 @@ function dailyNotePath(config, m) {
     return obsidian.normalizePath(folder ? `${folder}/${filename}` : filename);
 }
 
+// Canonical (un-suffixed) path of a week's review note. Mirrors the base name
+// writeReviewNote() creates, so callers can detect an already-written review.
+function reviewNotePath(folder, weekstamp) {
+    const dir = (folder || '').replace(/\/+$/, '');
+    return obsidian.normalizePath(dir ? `${dir}/${weekstamp}.md` : `${weekstamp}.md`);
+}
+
 function resolveTemplatePath(rawPath) {
     let p = (rawPath || '').trim();
     if (!p) return null;
@@ -1124,6 +1131,19 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const weekstamp = day.format('GGGG-[W]WW');
         const dates = weekDates(day);
 
+        // The review note file is the durable, synced source of truth for
+        // "this week is reviewed" — not lastReviewWeekstamp, which lives in
+        // data.json and syncs separately. If a note for this week already
+        // exists, an automatic (scheduled/catch-up) run must NOT regenerate
+        // over it: that note may have been written on another device and
+        // synced here before this device's stamp caught up, and it may hold
+        // notes the user added. Just record the week as done locally and stop.
+        if (!notify && this.app.vault.getAbstractFileByPath(reviewNotePath(s.folder, weekstamp)) instanceof obsidian.TFile) {
+            s.lastReviewWeekstamp = weekstamp;
+            await this.saveSettings();
+            return;
+        }
+
         const sections = [];
         const openTasks = [];
         for (const d of dates) {
@@ -1200,23 +1220,22 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             // createFolder throws if it already exists — tolerate the race.
             try { await this.app.vault.createFolder(dir); } catch (e) { /* already exists */ }
         }
-        const path = obsidian.normalizePath(dir ? `${dir}/${weekstamp}.md` : `${weekstamp}.md`);
-        const existing = this.app.vault.getAbstractFileByPath(path);
-        if (existing instanceof obsidian.TFile) {
-            await this.app.vault.modify(existing, content);
-            return existing;
-        }
-        try {
-            return await this.app.vault.create(path, content);
-        } catch (e) {
-            // Lost a create race (file appeared between the check and create) — modify instead.
-            const f = this.app.vault.getAbstractFileByPath(path);
-            if (f instanceof obsidian.TFile) {
-                await this.app.vault.modify(f, content);
-                return f;
+        // Never overwrite an existing review note — it may hold notes the user
+        // added. Automatic runs are already short-circuited before reaching
+        // here; a collision means a manual re-run, so write a numbered sibling
+        // and leave the original untouched.
+        const base = obsidian.normalizePath(dir ? `${dir}/${weekstamp}` : weekstamp);
+        for (let n = 0; n < 100; n++) {
+            const path = n === 0 ? `${base}.md` : `${base} (${n}).md`;
+            if (this.app.vault.getAbstractFileByPath(path)) continue;
+            try {
+                return await this.app.vault.create(path, content);
+            } catch (e) {
+                // Lost a create race (file appeared between the check and
+                // create) — try the next name rather than clobbering it.
             }
-            throw e;
         }
+        throw new Error(`No free filename for weekly review ${weekstamp}`);
     }
 }
 
