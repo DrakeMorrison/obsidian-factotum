@@ -712,19 +712,6 @@ async function submitToBeeminder(s, value, daystamp, comment) {
 
 // ── Weekly review ───────────────────────────────────────────────────────────
 
-// Collect the text of unchecked `- [ ]` tasks from a note, including indented /
-// nested tasks (leading whitespace and a tab or space after the bullet).
-function extractOpenTasks(text) {
-    const tasks = [];
-    for (const line of (text || '').split('\n')) {
-        const bullet = line.match(/^\s*[-*+]\s+(.+)$/);
-        if (!bullet) continue;
-        const open = bullet[1].trim().match(/^\[ \]\s+(.+)$/);
-        if (open) tasks.push(open[1].trim());
-    }
-    return tasks;
-}
-
 // Return the body under the markdown heading whose text matches `heading`
 // (case-insensitive), up to the next heading of the same or higher level.
 function extractSection(content, heading) {
@@ -797,16 +784,14 @@ function weeklyReviewSystem(hasGoals) {
     let s =
         'You are writing a weekly review from a user\'s Obsidian daily notes. ' +
         'Output GitHub-flavored markdown with the sections described below, in order, and nothing else. ' +
-        'First, `## AI Summary` — a concise prose recap of the week\'s themes, progress, and notable events. ' +
-        'Then, `## Potential TODOs` — a `- [ ]` checkbox list. ' +
-        'The TODO list must include every still-open task provided to you, plus any additional action items ' +
-        'you can reasonably infer from the notes. De-duplicate overlapping items. ';
+        'First, `## AI Summary` — a concise prose recap of the week\'s themes, progress, and notable events. ';
     if (hasGoals) {
         s +=
-            'Finally, `## Review Questions` — a `-` bullet list with exactly one reflective question per goal ' +
-            'provided to you, in the same order as the goals. Each question should prompt the user to assess ' +
-            'their progress on that goal this week, grounded in what the notes show. One question per goal, ' +
-            'no more, no fewer. ';
+            'Then, `## Review Questions` — under it, write exactly one reflective question per goal ' +
+            'provided to you, in the same order as the goals. Render each question as its own `###` heading ' +
+            '(the heading text is the question itself), followed by a blank line so the user can write their ' +
+            'answer underneath. Each question should prompt the user to assess their progress on that goal ' +
+            'this week, grounded in what the notes show. One question per goal, no more, no fewer. ';
     }
     s += 'Do not invent events that are not supported by the notes.';
     return s;
@@ -1176,14 +1161,12 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         }
 
         const sections = [];
-        const openTasks = [];
         for (const d of dates) {
             const file = this.app.vault.getAbstractFileByPath(dailyNotePath(config, d));
             if (!(file instanceof obsidian.TFile)) continue;
             const body = stripFrontmatter(await this.app.vault.cachedRead(file)).trim();
             if (!body) continue;
             sections.push(`### ${d.format('dddd, YYYY-MM-DD')}\n${body}`);
-            openTasks.push(...extractOpenTasks(body));
         }
 
         if (sections.length === 0) {
@@ -1194,15 +1177,12 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             return;
         }
 
-        const taskBlock = openTasks.length
-            ? `Still-open tasks (include all of these):\n${openTasks.map(t => `- [ ] ${t}`).join('\n')}`
-            : 'Still-open tasks: (none found)';
         // Read the goals section so Claude can pose a review question per goal.
         const goalsText = await readEmbeddedSection(this.app, s.goalsSource);
         const goalsBlock = goalsText
             ? `\n\nThe user's goals (write exactly one review question for each):\n${goalsText}`
             : '';
-        const userContent = `Daily notes for the week of ${weekstamp} (${dates[0].format('YYYY-MM-DD')} to ${dates[6].format('YYYY-MM-DD')}):\n\n${sections.join('\n\n')}\n\n${taskBlock}${goalsBlock}`;
+        const userContent = `Daily notes for the week of ${weekstamp} (${dates[0].format('YYYY-MM-DD')} to ${dates[6].format('YYYY-MM-DD')}):\n\n${sections.join('\n\n')}${goalsBlock}`;
 
         new obsidian.Notice(`Drake's Factotum: generating weekly review for ${weekstamp}…`);
         let result;
