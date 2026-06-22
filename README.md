@@ -53,6 +53,12 @@ By default this works on the note you're currently viewing. To always add to one
 
 Lines like `- [x] done thing` are skipped — they don't appear in comparisons and stay put when the list is rewritten. Active tasks (`- [ ] thing`) and plain bullets (`- thing`) are both ranked.
 
+### Scroll offset (nvim-style scrolloff)
+
+Keeps a margin of context lines above and below the cursor while editing, so you're never writing against the very top or bottom edge of the window — the view scrolls a little ahead of you, the way Vim's `scrolloff` does.
+
+Set the number of lines in **Settings → Drake's Factotum → Editing → Scroll offset** (defaults to **10**). Set it to `0` to turn the behavior off.
+
 ### Nightly word count → Beeminder
 
 Optionally, the plugin can post your daily writing output to a [Beeminder](https://www.beeminder.com) goal every night at **11PM**.

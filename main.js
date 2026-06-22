@@ -614,6 +614,7 @@ function totalActiveItems(parsed) {
 
 const DEFAULT_SETTINGS = {
     todoNotePath: '',               // note that "Add new item" targets; blank = active note
+    scrollOff: 10,                  // min lines of context kept above/below the cursor (nvim scrolloff); 0 = off
     beeminder: {
         enabled: false,
         authToken: '',
@@ -817,6 +818,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         this.addSettingTab(new FactotumSettingTab(this.app, this));
         this.beeminderTimer = null;
         this.weeklyTimer = null;
+        this.setupScrollOff();
         this.app.workspace.onLayoutReady(() => {
             this.maybeCatchUpBeeminder();
             this.scheduleBeeminderSubmission();
@@ -901,6 +903,35 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         this.clearBeeminderTimer();
         this.clearWeeklyTimer();
         console.log('Drake\'s Factotum unloaded');
+    }
+
+    // nvim-style scrolloff: keep `scrollOff` lines of context above and below the
+    // cursor so you're never typing against the top or bottom edge of the view.
+    //
+    // This rides CodeMirror 6's native scroll-into-view, which fires on every
+    // cursor move/keystroke and respects the `scrollMargins` facet — so a margin
+    // of N line-heights makes CM scroll before the cursor gets within N lines of
+    // an edge. There's no build step here, so we can't import EditorView; instead
+    // we lift the class off a live editor instance the first time one exists, then
+    // call updateOptions() to apply the extension to already-open editors.
+    setupScrollOff() {
+        let registered = false;
+        const tryRegister = () => {
+            if (registered) return;
+            const cm = this.app.workspace.getActiveViewOfType(obsidian.MarkdownView)?.editor?.cm;
+            const EditorView = cm?.constructor;
+            if (!EditorView?.scrollMargins) return;
+            this.registerEditorExtension(EditorView.scrollMargins.of((view) => {
+                const lines = this.settings.scrollOff;
+                if (!lines || lines < 1) return null;
+                const margin = view.defaultLineHeight * lines;
+                return { top: margin, bottom: margin };
+            }));
+            this.app.workspace.updateOptions();
+            registered = true;
+        };
+        this.app.workspace.onLayoutReady(tryRegister);
+        this.registerEvent(this.app.workspace.on('active-leaf-change', tryRegister));
     }
 
     async loadSettings() {
@@ -1260,6 +1291,25 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
                 .setPlaceholder('TODO.md')
                 .setValue(this.plugin.settings.todoNotePath)
                 .onChange(async (v) => { this.plugin.settings.todoNotePath = v.trim(); await this.plugin.saveSettings(); }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Editing')
+            .setHeading();
+
+        new obsidian.Setting(containerEl)
+            .setName('Scroll offset')
+            .setDesc('Keep this many lines visible above and below the cursor while editing (nvim-style scrolloff), so you never type against the top or bottom edge. Set to 0 to disable.')
+            .addText(t => {
+                t.setPlaceholder('10')
+                    .setValue(String(this.plugin.settings.scrollOff))
+                    .onChange(async (v) => {
+                        const n = Math.max(0, Math.floor(Number(v)));
+                        this.plugin.settings.scrollOff = Number.isFinite(n) ? n : 0;
+                        await this.plugin.saveSettings();
+                    });
+                t.inputEl.type = 'number';
+                t.inputEl.min = '0';
+            });
 
         const b = this.plugin.settings.beeminder;
 
