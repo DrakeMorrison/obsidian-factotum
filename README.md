@@ -57,7 +57,7 @@ Lines like `- [x] done thing` are skipped — they don't appear in comparisons a
 
 Keeps a margin of context lines above and below the cursor while editing, so you're never writing against the very top or bottom edge of the window — the view scrolls a little ahead of you, the way Vim's `scrolloff` does.
 
-Set the number of lines in **Settings → Drake's Factotum → Editing → Scroll offset** (defaults to **10**). Set it to `0` to turn the behavior off.
+Set the number of lines in **Settings → Drake's Factotum → Editing → Scroll offset** (defaults to **10**). Set it to `0` to turn the behavior off. Desktop only — it's ignored on mobile, where the on-screen keyboard already manages the viewport.
 
 ### Nightly word count → Beeminder
 

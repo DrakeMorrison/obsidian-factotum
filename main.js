@@ -892,6 +892,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
 
     // nvim-style scrolloff: keep `scrollOff` lines of context above and below the
     // cursor so you're never typing against the top or bottom edge of the view.
+    // Desktop only — see the mobile bail-out in the scrollMargins callback below.
     //
     // This rides CodeMirror 6's native scroll-into-view, which fires on every
     // cursor move/keystroke and respects the `scrollMargins` facet — so a margin
@@ -907,6 +908,10 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             const EditorView = cm?.constructor;
             if (!EditorView?.scrollMargins) return;
             this.registerEditorExtension(EditorView.scrollMargins.of((view) => {
+                // Skip on mobile: the on-screen keyboard already shrinks the
+                // viewport, and a scroll margin on top of that fights the native
+                // cursor-into-view, jumping the display around while you type.
+                if (obsidian.Platform.isMobile) return null;
                 const lines = this.settings.scrollOff;
                 if (!lines || lines < 1) return null;
                 const margin = view.defaultLineHeight * lines;
@@ -1278,7 +1283,7 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
 
         new obsidian.Setting(containerEl)
             .setName('Scroll offset')
-            .setDesc('Keep this many lines visible above and below the cursor while editing (nvim-style scrolloff), so you never type against the top or bottom edge. Set to 0 to disable.')
+            .setDesc('Keep this many lines visible above and below the cursor while editing (nvim-style scrolloff), so you never type against the top or bottom edge. Set to 0 to disable. Desktop only — ignored on mobile.')
             .addText(t => {
                 t.setPlaceholder('10')
                     .setValue(String(this.plugin.settings.scrollOff))
