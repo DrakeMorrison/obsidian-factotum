@@ -45,16 +45,24 @@ function parseNote(content) {
     if (!matrixMode) {
         const items = [];
         const done  = [];
-        for (const line of lines) {
-            const m = line.match(/^[-*+] (.+)$/);
-            if (!m) continue;
+        let i = 0;
+        while (i < lines.length) {
+            const m = lines[i].match(/^[-*+] (.+)$/);
+            if (!m) { i++; continue; }
+            // A top-level bullet owns the contiguous indented lines below it
+            // (nested bullets, sub-tasks, continuation text). They travel with
+            // it as a block so sorting preserves nested structure.
+            const children = [];
+            let j = i + 1;
+            while (j < lines.length && /^\s+\S/.test(lines[j])) { children.push(lines[j]); j++; }
+            i = j;
             let text = m[1].trim();
             const doneMatch = text.match(/^\[[xX]\]\s+(.+)$/);
-            if (doneMatch) { done.push({ text: doneMatch[1], isTask: true }); continue; }
+            if (doneMatch) { done.push({ text: doneMatch[1], isTask: true, children }); continue; }
             let isTask = false;
             const taskMatch = text.match(/^\[ \]\s+(.+)$/);
             if (taskMatch) { isTask = true; text = taskMatch[1]; }
-            items.push({ text, isTask });
+            items.push({ text, isTask, children });
         }
         return { mode: 'flat', items, done };
     }
@@ -64,30 +72,41 @@ function parseNote(content) {
     const sections = emptySections();
     let section = 'preamble';
     let sawQuadrant = false;
+    let lastItem = null;
     const preamble = [];
 
     for (const line of lines) {
         const headingMatch = line.match(/^#{1,6}\s+(.+)$/);
         if (headingMatch) {
+            lastItem = null;
             const cls = classifyHeading(headingMatch[1]);
             if (cls !== null) { section = cls; sawQuadrant = true; continue; }
             if (!sawQuadrant) preamble.push(line);
             continue;
         }
 
+        // Indented lines below a bullet are its nested block — keep them with it.
+        if (lastItem && /^\s+\S/.test(line)) { lastItem.children.push(line); continue; }
+
         const bulletMatch = line.match(/^[-*+] (.+)$/);
         if (bulletMatch) {
             let text = bulletMatch[1].trim();
             const doneMatch = text.match(/^\[[xX]\]\s+(.+)$/);
-            if (doneMatch) { sections.done.push({ text: doneMatch[1], isTask: true }); continue; }
+            if (doneMatch) {
+                lastItem = { text: doneMatch[1], isTask: true, children: [] };
+                sections.done.push(lastItem);
+                continue;
+            }
             let isTask = false;
             const taskMatch = text.match(/^\[ \]\s+(.+)$/);
             if (taskMatch) { isTask = true; text = taskMatch[1]; }
             const bucket = (section === 'preamble' || section === 'done') ? 'Q2' : section;
-            sections[bucket].push({ text, isTask });
+            lastItem = { text, isTask, children: [] };
+            sections[bucket].push(lastItem);
             continue;
         }
 
+        lastItem = null;
         if (!sawQuadrant) preamble.push(line);
     }
 
@@ -98,29 +117,47 @@ function renderItemLine(item) {
     return item.isTask ? `- [ ] ${item.text}` : `- ${item.text}`;
 }
 
+// An item plus its nested lines, rendered as a block of lines that move together.
+function renderItemBlock(item) {
+    const block = [renderItemLine(item)];
+    if (item.children && item.children.length) block.push(...item.children);
+    return block;
+}
+
 function serializeFlat(content, sortedItems) {
-    const replacements = sortedItems.map(renderItemLine);
+    const replacements = sortedItems.map(renderItemBlock);
 
     const lines = content.split('\n');
     const newLines = [];
-    const doneLines = [];
+    const doneBlocks = [];
     let lastSortedIdx = -1;
     let idx = 0;
+    let i = 0;
 
-    for (const line of lines) {
+    while (i < lines.length) {
+        const line = lines[i];
         if (/^[-*+] \[[xX]\]\s/.test(line)) {
-            doneLines.push(line);
+            // Done item: keep its block verbatim and stash it for the tail.
+            const block = [line];
+            i++;
+            while (i < lines.length && /^\s+\S/.test(lines[i])) { block.push(lines[i]); i++; }
+            doneBlocks.push(block);
         } else if (/^[-*+] /.test(line)) {
+            // Active bullet: swap in the next ranked block, dropping the original
+            // nested lines (they ride along inside the replacement block).
+            i++;
+            while (i < lines.length && /^\s+\S/.test(lines[i])) i++;
             if (idx < replacements.length) {
-                newLines.push(replacements[idx++]);
+                newLines.push(...replacements[idx++]);
                 lastSortedIdx = newLines.length - 1;
             }
         } else {
             newLines.push(line);
+            i++;
         }
     }
 
-    const tail = [...replacements.slice(idx), ...doneLines];
+    const tail = [...replacements.slice(idx), ...doneBlocks].flat();
     if (tail.length > 0) {
         const insertAt = lastSortedIdx >= 0 ? lastSortedIdx + 1 : newLines.length;
         newLines.splice(insertAt, 0, ...tail);
@@ -145,12 +182,15 @@ function serializeMatrix(originalContent, sections) {
 
     for (const q of QUADRANTS) {
         out.push(`## ${q.heading}`);
-        for (const item of sections[q.key]) out.push(renderItemLine(item));
+        for (const item of sections[q.key]) out.push(...renderItemBlock(item));
         out.push('');
     }
 
     out.push(`## ${DONE_HEADING}`);
-    for (const item of sections.done) out.push(`- [x] ${item.text}`);
+    for (const item of sections.done) {
+        out.push(`- [x] ${item.text}`);
+        if (item.children && item.children.length) out.push(...item.children);
+    }
 
     return out.join('\n');
 }

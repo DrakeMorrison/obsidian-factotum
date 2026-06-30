@@ -53,6 +53,20 @@ By default this works on the note you're currently viewing. To always add to one
 
 Lines like `- [x] done thing` are skipped — they don't appear in comparisons and stay put when the list is rewritten. Active tasks (`- [ ] thing`) and plain bullets (`- thing`) are both ranked.
 
+### Nested tasks
+
+Indented lines beneath a bullet — sub-tasks, nested checkboxes, or continuation text — are treated as part of that item. Only the top-level bullets are compared, and each one's nested block travels with it when the list is reordered, so structure like this is preserved:
+
+```markdown
+- [ ] Build the side project
+    - [ ] Sketch the UI
+    - [ ] Pick the stack
+- Learn Spanish
+    - via Duolingo
+```
+
+After ranking, `Sketch the UI` and `Pick the stack` stay under `Build the side project` wherever it lands.
+
 ### Scroll offset (nvim-style scrolloff)
 
 Keeps a margin of context lines above and below the cursor while editing, so you're never writing against the very top or bottom edge of the window — the view scrolls a little ahead of you, the way Vim's `scrolloff` does.
