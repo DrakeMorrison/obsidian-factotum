@@ -86,23 +86,27 @@ Each night it counts the words in today's daily note, **subtracts the word count
 
 If Obsidian wasn't open at 11PM, it catches up the next time you launch (provided it's still past 11PM and that day hasn't been sent yet). Re-sends for the same day update the datapoint rather than duplicating it. Use **Send now** in settings to test your setup.
 
-### Weekly review note
+### Periodic review notes (weekly, monthly, quarterly, yearly)
 
-Optionally, the plugin can generate a **weekly review note** at the start of each week (just after **Sunday** midnight, i.e. early **Monday**). It reads the just-finished week's daily notes (Monday–Sunday) and uses the [Anthropic Claude API](https://www.anthropic.com) to write:
+Optionally, the plugin can generate a review note whenever a period closes — **weekly** (just after Sunday midnight), **monthly** (just after midnight on the 1st), **quarterly** (Jan/Apr/Jul/Oct 1), and **yearly** (January 1). Each is enabled independently, and each reads the just-finished period's **daily notes** directly — the longer reviews don't summarize the shorter ones — and uses the [Anthropic Claude API](https://www.anthropic.com) to write:
 
-- a prose **`## Summary`** of the week, and
-- a **`## Potential TODOs`** checkbox list — every still-open `- [ ]` task from the week, plus action items inferred from your notes.
+- a prose **`## AI Summary`** of the period, and
+- **`## Review Questions`** — one reflective question per goal in your goals note, each as a heading with space to write your answer underneath.
 
-Enable it in **Settings → Drake's Factotum** and fill in:
+Enable them in **Settings → Drake's Factotum**. All reviews share:
 
 - **Anthropic API key** — from [console.anthropic.com](https://console.anthropic.com)
 - **Model** — defaults to `claude-opus-4-8` (any Anthropic model id works)
-- **Review folder** — defaults to `Weekly Reviews`
+
+and each has its own:
+
+- **Review folder** — defaults to `Weekly Reviews`, `Monthly Reviews`, `Quarterly Reviews`, `Yearly Reviews`
 - **Header embed** (optional) — inserted at the top of every review, above the summary. Defaults to `![[goals#goals]]` (an embed of your goals note); blank to omit.
+- **Goals source** (optional) — a wiki link like `![[goals#goals]]` whose linked section is read so the review ends with one question per goal; blank to skip the questions.
 
-The note is saved as `Weekly Reviews/<ISO-week>.md` (e.g. `Weekly Reviews/2026-W23.md`), created and named automatically. Daily notes are located from your **Daily Notes** or **Periodic Notes** settings. If Obsidian was closed at the scheduled time (including on mobile, where background timers don't fire), it catches up on the next launch for the most recent Sunday that wasn't yet generated. Re-running overwrites that week's note rather than duplicating it. Use **Generate now** in settings to test your setup.
+Notes are named by period — `2026-W23.md`, `2026-06.md`, `2026-Q2.md`, `2026.md` — and created automatically in their folder. Daily notes are located from your **Daily Notes** or **Periodic Notes** settings. If Obsidian was closed at the scheduled time (including on mobile, where background timers don't fire), it catches up on the next launch for the most recent period that wasn't yet generated. An existing review note is never overwritten — a manual re-run writes a numbered sibling instead. Use **Generate now** in settings to test your setup (mid-period it reviews the days so far).
 
-> Each run makes one Claude API call (typically a few cents). The API key is stored locally in the plugin's `data.json`.
+> Each run makes one Claude API call (typically a few cents; the yearly review sends a full year of daily notes, so it costs more — very large vaults may approach the model's context limit). The API key is stored locally in the plugin's `data.json`.
 
 ---
 
