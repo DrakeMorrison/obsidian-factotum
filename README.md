@@ -49,6 +49,14 @@ Type your new item, then answer ~log₂(n) comparisons to slot it in the right p
 
 By default this works on the note you're currently viewing. To always add to one designated TODO note no matter which note is open, set a **TODO note path** in **Settings → Drake's Factotum** (e.g. `TODO.md`). The command then targets that note from anywhere — and stays available even when no note is open. Leave the path blank to keep the original "current note" behavior.
 
+### Inbox: capture now, prioritize later
+
+Add an `## Inbox` heading anywhere in your TODO note (top or bottom — it stays where you put it) and toss unprioritized bullets under it as they occur to you. Inbox items are ignored by ranking sessions — they hold no rank until you triage them. When you're ready:
+
+> **Drake's Factotum: Triage inbox (prioritize and place each item)**
+
+Each inbox item is walked through the usual flow — in a matrix note you classify it (urgent? important?) and then binary-search-place it within its quadrant; in a flat note it's binary-search-placed straight into the ranked list. On save, every item lands in its spot and the Inbox is emptied (the heading stays, ready for the next capture).
+
 ### Checked-off tasks
 
 Lines like `- [x] done thing` are skipped — they don't appear in comparisons and stay put when the list is rewritten. Active tasks (`- [ ] thing`) and plain bullets (`- thing`) are both ranked.

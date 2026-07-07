@@ -11,9 +11,11 @@ const QUADRANTS = [
     { key: 'Q4', heading: 'Delete — Neither',                 urgent: false, important: false },
 ];
 const DONE_HEADING = 'Done';
+const INBOX_HEADING = 'Inbox';
 
 function classifyHeading(text) {
     const t = text.trim().toLowerCase();
+    if (/^inbox\b/.test(t)) return 'inbox';
     if (/^done\b/.test(t)) return 'done';
     if (/^do\b/.test(t))       return 'Q1';
     if (/^schedule\b/.test(t)) return 'Q2';
@@ -23,7 +25,7 @@ function classifyHeading(text) {
 }
 
 function emptySections() {
-    return { Q1: [], Q2: [], Q3: [], Q4: [], done: [] };
+    return { inbox: [], Q1: [], Q2: [], Q3: [], Q4: [], done: [] };
 }
 
 function findQuadrant(urgent, important) {
@@ -35,18 +37,25 @@ function findQuadrant(urgent, important) {
 function parseNote(content) {
     const lines = content.split('\n');
 
-    // Detect matrix mode: any heading line that classifies as a quadrant or done.
+    // Detect matrix mode: any heading line that classifies as a quadrant or
+    // done. An Inbox heading alone doesn't make a note a matrix — a flat
+    // ranked list can have an inbox too.
     let matrixMode = false;
     for (const line of lines) {
         const m = line.match(/^#{1,6}\s+(.+)$/);
-        if (m && classifyHeading(m[1]) !== null) { matrixMode = true; break; }
+        const cls = m ? classifyHeading(m[1]) : null;
+        if (cls !== null && cls !== 'inbox') { matrixMode = true; break; }
     }
 
     if (!matrixMode) {
         const items = [];
         const done  = [];
+        const inbox = [];
+        let inInbox = false;
         let i = 0;
         while (i < lines.length) {
+            const h = lines[i].match(/^#{1,6}\s+(.+)$/);
+            if (h) { inInbox = classifyHeading(h[1]) === 'inbox'; i++; continue; }
             const m = lines[i].match(/^[-*+] (.+)$/);
             if (!m) { i++; continue; }
             // A top-level bullet owns the contiguous indented lines below it
@@ -62,9 +71,9 @@ function parseNote(content) {
             let isTask = false;
             const taskMatch = text.match(/^\[ \]\s+(.+)$/);
             if (taskMatch) { isTask = true; text = taskMatch[1]; }
-            items.push({ text, isTask, children });
+            (inInbox ? inbox : items).push({ text, isTask, children });
         }
-        return { mode: 'flat', items, done };
+        return { mode: 'flat', items, done, inbox };
     }
 
     // Matrix mode: bucket items by surrounding heading. Active bullets above
@@ -124,24 +133,40 @@ function renderItemBlock(item) {
     return block;
 }
 
-function serializeFlat(content, sortedItems) {
+function serializeFlat(content, sortedItems, clearInbox = false) {
     const replacements = sortedItems.map(renderItemBlock);
 
     const lines = content.split('\n');
     const newLines = [];
     const doneBlocks = [];
     let lastSortedIdx = -1;
+    let inboxHeadingIdx = -1;
+    let inInbox = false;
     let idx = 0;
     let i = 0;
 
     while (i < lines.length) {
         const line = lines[i];
-        if (/^[-*+] \[[xX]\]\s/.test(line)) {
+        const h = line.match(/^#{1,6}\s+(.+)$/);
+        if (h) {
+            inInbox = classifyHeading(h[1]) === 'inbox';
+            if (inInbox && inboxHeadingIdx < 0) inboxHeadingIdx = newLines.length;
+            newLines.push(line);
+            i++;
+        } else if (/^[-*+] \[[xX]\]\s/.test(line)) {
             // Done item: keep its block verbatim and stash it for the tail.
             const block = [line];
             i++;
             while (i < lines.length && /^\s+\S/.test(lines[i])) { block.push(lines[i]); i++; }
             doneBlocks.push(block);
+        } else if (inInbox && /^[-*+] /.test(line)) {
+            // Inbox bullets are unranked and don't participate in sorting:
+            // leave them where they are — unless a triage just placed them
+            // into the ranked list, in which case drop the originals.
+            const block = [line];
+            i++;
+            while (i < lines.length && /^\s+\S/.test(lines[i])) { block.push(lines[i]); i++; }
+            if (!clearInbox) newLines.push(...block);
         } else if (/^[-*+] /.test(line)) {
             // Active bullet: swap in the next ranked block, dropping the original
             // nested lines (they ride along inside the replacement block).
@@ -159,7 +184,12 @@ function serializeFlat(content, sortedItems) {
 
     const tail = [...replacements.slice(idx), ...doneBlocks].flat();
     if (tail.length > 0) {
-        const insertAt = lastSortedIdx >= 0 ? lastSortedIdx + 1 : newLines.length;
+        // Prefer right after the last ranked item; with no ranked items at all
+        // (e.g. a note whose only bullets were in the Inbox), land above the
+        // Inbox heading so placed items don't end up back inside it.
+        const insertAt = lastSortedIdx >= 0 ? lastSortedIdx + 1
+            : inboxHeadingIdx >= 0 ? inboxHeadingIdx
+            : newLines.length;
         newLines.splice(insertAt, 0, ...tail);
     }
 
@@ -167,18 +197,45 @@ function serializeFlat(content, sortedItems) {
 }
 
 function serializeMatrix(originalContent, sections) {
-    // Preserve everything above the first quadrant heading verbatim.
+    // Preserve everything above the first recognized heading verbatim, and
+    // note whether the note keeps its Inbox above the quadrants or below Done
+    // so the rewrite leaves it where the user put it.
     const lines = originalContent.split('\n');
     const preamble = [];
+    let hadInbox = false;
+    let inboxAtTop = false;
+    let sawOtherHeading = false;
     for (const line of lines) {
         const m = line.match(/^#{1,6}\s+(.+)$/);
+        const cls = m ? classifyHeading(m[1]) : null;
+        if (cls === 'inbox') { hadInbox = true; if (!sawOtherHeading) inboxAtTop = true; }
+        else if (cls !== null) sawOtherHeading = true;
+    }
+    // Bullets above the first recognized heading were parsed into sections
+    // (Q2, done, …) and will be re-rendered there — skip them (and their
+    // nested blocks) here so they aren't duplicated in the preamble.
+    for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/^#{1,6}\s+(.+)$/);
         if (m && classifyHeading(m[1]) !== null) break;
-        preamble.push(line);
+        if (/^[-*+] /.test(lines[i])) {
+            while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) i++;
+            continue;
+        }
+        preamble.push(lines[i]);
     }
     while (preamble.length && preamble[preamble.length - 1].trim() === '') preamble.pop();
 
     const out = [];
     if (preamble.length > 0) { out.push(...preamble); out.push(''); }
+
+    const inboxItems = sections.inbox || [];
+    const renderInbox = () => {
+        out.push(`## ${INBOX_HEADING}`);
+        for (const item of inboxItems) out.push(...renderItemBlock(item));
+        out.push('');
+    };
+    // Keep the (possibly emptied) Inbox heading around as a capture spot.
+    if ((hadInbox || inboxItems.length > 0) && inboxAtTop) renderInbox();
 
     for (const q of QUADRANTS) {
         out.push(`## ${q.heading}`);
@@ -190,6 +247,11 @@ function serializeMatrix(originalContent, sections) {
     for (const item of sections.done) {
         out.push(`- [x] ${item.text}`);
         if (item.children && item.children.length) out.push(...item.children);
+    }
+
+    if ((hadInbox || inboxItems.length > 0) && !inboxAtTop) {
+        out.push('');
+        renderInbox();
     }
 
     return out.join('\n');
@@ -237,6 +299,7 @@ class RankSessionModal extends obsidian.Modal {
 
         const out = emptySections();
         out.done = this.payload.sections.done;
+        out.inbox = this.payload.sections.inbox;
         for (const q of QUADRANTS) {
             this.currentQuadrantLabel = q.heading;
             const items = this.payload.sections[q.key];
@@ -529,6 +592,7 @@ class AddItemModal extends obsidian.Modal {
                 this.onComplete({ mode: 'flat', items: sortedWithNew });
             } else {
                 const newSections = {
+                    inbox: [...this.payload.sections.inbox],
                     Q1: [...this.payload.sections.Q1],
                     Q2: [...this.payload.sections.Q2],
                     Q3: [...this.payload.sections.Q3],
@@ -537,6 +601,183 @@ class AddItemModal extends obsidian.Modal {
                 };
                 newSections[placedQuadrant.key] = sortedWithNew;
                 this.onComplete({ mode: 'matrix', sections: newSections });
+            }
+            this.close();
+        });
+    }
+}
+
+// ── Triage inbox: classify & place each unprioritized item ──────────────────
+
+class TriageInboxModal extends obsidian.Modal {
+    constructor(app, payload, onComplete) {
+        super(app);
+        this.payload = payload;
+        this.onComplete = onComplete;
+        if (payload.mode === 'flat') {
+            this.queue = [...payload.inbox];
+            this.items = [...payload.items];
+        } else {
+            this.queue = [...payload.sections.inbox];
+            this.sections = {};
+            for (const key of Object.keys(payload.sections)) {
+                this.sections[key] = [...payload.sections[key]];
+            }
+            this.sections.inbox = [];
+        }
+        this.idx = 0;
+        this.placed = new Set();
+        this.urgent = null;
+        this.targetQuadrant = null;
+        // Binary-search placement state for the current item.
+        this.list = null;
+        this.lo = 0;
+        this.hi = 0;
+    }
+
+    onOpen() {
+        this.modalEl.addClass('ordinal-modal');
+        this.nextItem();
+    }
+    onClose() { this.contentEl.empty(); }
+
+    current() { return this.queue[this.idx]; }
+    progressLabel() { return `Inbox item ${this.idx + 1} of ${this.queue.length}`; }
+
+    nextItem() {
+        if (this.idx >= this.queue.length) { this.renderResults(); return; }
+        if (this.payload.mode === 'flat') {
+            this.targetQuadrant = null;
+            this.startPlacement(this.items);
+        } else {
+            this.askUrgent();
+        }
+    }
+
+    askUrgent() {
+        const item = this.current();
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createDiv({ cls: 'ordinal-quadrant-label', text: this.progressLabel() });
+        contentEl.createEl('h2', { text: item.text });
+        contentEl.createEl('p', { text: 'Is this urgent?', cls: 'ordinal-hint' });
+
+        const grid = contentEl.createDiv({ cls: 'ordinal-grid' });
+        const yes = grid.createEl('button', { text: 'Yes, urgent', cls: 'ordinal-choice' });
+        grid.createDiv({ cls: 'ordinal-vs', text: '/' });
+        const no  = grid.createEl('button', { text: 'No, not urgent', cls: 'ordinal-choice' });
+        yes.addEventListener('click', () => { this.urgent = true;  this.askImportant(); });
+        no .addEventListener('click', () => { this.urgent = false; this.askImportant(); });
+    }
+
+    askImportant() {
+        const item = this.current();
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createDiv({ cls: 'ordinal-quadrant-label', text: this.progressLabel() });
+        contentEl.createEl('h2', { text: item.text });
+        contentEl.createEl('p', { text: 'Is this important?', cls: 'ordinal-hint' });
+
+        const grid = contentEl.createDiv({ cls: 'ordinal-grid' });
+        const yes = grid.createEl('button', { text: 'Yes, important', cls: 'ordinal-choice' });
+        grid.createDiv({ cls: 'ordinal-vs', text: '/' });
+        const no  = grid.createEl('button', { text: 'No, not important', cls: 'ordinal-choice' });
+        yes.addEventListener('click', () => this.classify(true));
+        no .addEventListener('click', () => this.classify(false));
+    }
+
+    classify(important) {
+        this.targetQuadrant = findQuadrant(this.urgent, important);
+        this.startPlacement(this.sections[this.targetQuadrant.key]);
+    }
+
+    // Binary-search the current item into `list` (mutated in place), so later
+    // inbox items are also compared against the ones placed before them.
+    startPlacement(list) {
+        this.list = list;
+        this.lo = 0;
+        this.hi = list.length - 1;
+        this.renderCompare();
+    }
+
+    renderCompare() {
+        if (this.lo > this.hi) { this.place(this.lo); return; }
+
+        const mid     = Math.floor((this.lo + this.hi) / 2);
+        const against = this.list[mid];
+        const item    = this.current();
+
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createDiv({ cls: 'ordinal-quadrant-label', text: this.progressLabel() });
+        if (this.targetQuadrant) {
+            contentEl.createDiv({ cls: 'ordinal-quadrant-label', text: this.targetQuadrant.heading });
+        }
+        contentEl.createEl('h2', { text: 'Which matters more?' });
+
+        const grid = contentEl.createDiv({ cls: 'ordinal-grid' });
+        const btnNew = grid.createEl('button', { text: item.text, cls: 'ordinal-choice ordinal-new' });
+        grid.createDiv({ cls: 'ordinal-vs', text: 'VS' });
+        const btnOld = grid.createEl('button', { text: against.text, cls: 'ordinal-choice' });
+
+        btnNew.addEventListener('click', () => { this.hi = mid - 1; this.renderCompare(); });
+        btnOld.addEventListener('click', () => { this.lo = mid + 1; this.renderCompare(); });
+    }
+
+    place(insertPosition) {
+        const item = this.current();
+        this.list.splice(insertPosition, 0, item);
+        this.placed.add(item);
+        this.idx++;
+        this.nextItem();
+    }
+
+    renderResults() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', { text: '✓ Inbox Triaged' });
+        contentEl.createEl('p', {
+            text: `${this.queue.length} item${this.queue.length === 1 ? '' : 's'} placed (★). The Inbox will be emptied.`,
+            cls: 'ordinal-hint'
+        });
+
+        const renderList = (parent, items) => {
+            const ol = parent.createEl('ol', { cls: 'ordinal-results-list' });
+            for (const item of items) {
+                const li = ol.createEl('li');
+                if (this.placed.has(item)) {
+                    li.addClass('ordinal-new-highlight');
+                    li.createSpan({ text: `★ ${item.text}` });
+                } else {
+                    li.createSpan({ text: item.text });
+                }
+            }
+        };
+
+        if (this.payload.mode === 'flat') {
+            renderList(contentEl, this.items);
+        } else {
+            for (const q of QUADRANTS) {
+                contentEl.createEl('h3', { text: q.heading, cls: 'ordinal-quadrant-header' });
+                const items = this.sections[q.key];
+                if (items.length === 0) {
+                    contentEl.createEl('p', { text: '(empty)', cls: 'ordinal-hint' });
+                } else {
+                    renderList(contentEl, items);
+                }
+            }
+        }
+
+        const saveBtn = contentEl.createEl('button', {
+            text: '💾 Save to note',
+            cls: 'ordinal-save-btn'
+        });
+        saveBtn.addEventListener('click', () => {
+            if (this.payload.mode === 'flat') {
+                this.onComplete({ mode: 'flat', items: this.items, clearInbox: true });
+            } else {
+                this.onComplete({ mode: 'matrix', sections: this.sections });
             }
             this.close();
         });
@@ -555,6 +796,7 @@ class ConvertModal extends obsidian.Modal {
         this.urgent = null;
         this.classified = emptySections();
         this.classified.done = this.doneItems;
+        this.classified.inbox = flatPayload.inbox || [];
     }
 
     onOpen() {
@@ -636,7 +878,7 @@ class ConvertModal extends obsidian.Modal {
 
 function computeResult(originalContent, result) {
     if (result.mode === 'flat') {
-        return serializeFlat(originalContent, result.items);
+        return serializeFlat(originalContent, result.items, !!result.clearInbox);
     }
     return serializeMatrix(originalContent, result.sections);
 }
@@ -943,6 +1185,24 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 new AddItemModal(this.app, parsed, async (result) => {
                     await target.write(computeResult(content, result));
                     new obsidian.Notice('Drake\'s Factotum: item added ✓');
+                }).open();
+            }
+        });
+
+        this.addCommand({
+            id: 'factotum-triage-inbox',
+            name: 'Triage inbox (prioritize and place each item)',
+            editorCallback: (editor) => {
+                const content = editor.getValue();
+                const parsed  = parseNote(content);
+                const inbox = parsed.mode === 'flat' ? parsed.inbox : parsed.sections.inbox;
+                if (inbox.length === 0) {
+                    new obsidian.Notice('Drake\'s Factotum: no items under an "Inbox" heading in this note.');
+                    return;
+                }
+                new TriageInboxModal(this.app, parsed, (result) => {
+                    applyResult(editor, content, result);
+                    new obsidian.Notice('Drake\'s Factotum: inbox triaged ✓');
                 }).open();
             }
         });
