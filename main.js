@@ -32,6 +32,16 @@ function findQuadrant(urgent, important) {
     return QUADRANTS.find(q => q.urgent === urgent && q.important === important);
 }
 
+// A task checked off inside a quadrant carries that classification along as
+// #urgent / #important tags when it migrates to Done — the metadata survives
+// the move and later doubles as calibration when Claude prioritizes the list.
+function withDoneTags(text, quadrant) {
+    let out = text;
+    if (quadrant.urgent && !/(^|\s)#urgent\b/.test(out)) out += ' #urgent';
+    if (quadrant.important && !/(^|\s)#important\b/.test(out)) out += ' #important';
+    return out;
+}
+
 // ── Markdown parsing / serialization ────────────────────────────────────────
 
 function parseNote(content) {
@@ -102,7 +112,9 @@ function parseNote(content) {
             let text = bulletMatch[1].trim();
             const doneMatch = text.match(/^\[[xX]\]\s+(.+)$/);
             if (doneMatch) {
-                lastItem = { text: doneMatch[1], isTask: true, children: [] };
+                const quadrant = QUADRANTS.find(q => q.key === section);
+                const doneText = quadrant ? withDoneTags(doneMatch[1], quadrant) : doneMatch[1];
+                lastItem = { text: doneText, isTask: true, children: [] };
                 sections.done.push(lastItem);
                 continue;
             }
@@ -133,7 +145,11 @@ function renderItemBlock(item) {
     return block;
 }
 
-function serializeFlat(content, sortedItems, clearInbox = false) {
+// `inboxItems` controls the Inbox section: null leaves its bullets untouched
+// (ordinary saves — inbox items are unranked and stay put); an array rewrites
+// the section to exactly those items (a triage passes what's still unplaced,
+// or [] when everything was placed).
+function serializeFlat(content, sortedItems, inboxItems = null) {
     const replacements = sortedItems.map(renderItemBlock);
 
     const lines = content.split('\n');
@@ -141,6 +157,7 @@ function serializeFlat(content, sortedItems, clearInbox = false) {
     const doneBlocks = [];
     let lastSortedIdx = -1;
     let inboxHeadingIdx = -1;
+    let inboxRewritten = false;
     let inInbox = false;
     let idx = 0;
     let i = 0;
@@ -152,6 +169,10 @@ function serializeFlat(content, sortedItems, clearInbox = false) {
             inInbox = classifyHeading(h[1]) === 'inbox';
             if (inInbox && inboxHeadingIdx < 0) inboxHeadingIdx = newLines.length;
             newLines.push(line);
+            if (inInbox && inboxItems && !inboxRewritten) {
+                inboxRewritten = true;
+                for (const item of inboxItems) newLines.push(...renderItemBlock(item));
+            }
             i++;
         } else if (/^[-*+] \[[xX]\]\s/.test(line)) {
             // Done item: keep its block verbatim and stash it for the tail.
@@ -161,12 +182,12 @@ function serializeFlat(content, sortedItems, clearInbox = false) {
             doneBlocks.push(block);
         } else if (inInbox && /^[-*+] /.test(line)) {
             // Inbox bullets are unranked and don't participate in sorting:
-            // leave them where they are — unless a triage just placed them
-            // into the ranked list, in which case drop the originals.
+            // leave them where they are — unless the caller is rewriting the
+            // Inbox, in which case the originals were rendered above.
             const block = [line];
             i++;
             while (i < lines.length && /^\s+\S/.test(lines[i])) { block.push(lines[i]); i++; }
-            if (!clearInbox) newLines.push(...block);
+            if (!inboxItems) newLines.push(...block);
         } else if (/^[-*+] /.test(line)) {
             // Active bullet: swap in the next ranked block, dropping the original
             // nested lines (they ride along inside the replacement block).
@@ -257,6 +278,11 @@ function serializeMatrix(originalContent, sections) {
     return out.join('\n');
 }
 
+// A one-line footer telling the user that closing the modal doesn't lose work.
+function closeHint(contentEl, text) {
+    contentEl.createEl('p', { text, cls: 'ordinal-hint ordinal-close-hint' });
+}
+
 // ── Pairwise ranking session (interactive merge sort) ───────────────────────
 
 class RankSessionModal extends obsidian.Modal {
@@ -266,6 +292,12 @@ class RankSessionModal extends obsidian.Modal {
         this.onComplete = onComplete;
         this.comparisonCount = 0;
         this.currentQuadrantLabel = null;
+        // Partial-progress state, so closing mid-session saves what's decided.
+        this.finished = false;      // a result was already handed to onComplete
+        this.finalResult = null;    // full result shown on the results screen
+        this.sortState = null;      // live view into the in-progress merge sort
+        this.matrixOut = null;      // matrix mode: quadrants finished so far
+        this.currentQuadrantKey = null;
 
         if (payload.mode === 'flat') {
             const n = Math.max(payload.items.length, 2);
@@ -284,7 +316,19 @@ class RankSessionModal extends obsidian.Modal {
         this.modalEl.addClass('ordinal-modal');
         this.run();
     }
-    onClose() { this.contentEl.empty(); }
+
+    // Closing mid-session keeps every decision made so far: completed merges
+    // (and completed quadrants) stay ordered, and whatever wasn't compared yet
+    // keeps its current relative order. Zero comparisons → nothing to save.
+    onClose() {
+        this.contentEl.empty();
+        if (this.finished) return;
+        const result = this.finalResult ||
+            (this.comparisonCount > 0 ? this.buildPartialResult() : null);
+        if (!result) return;
+        this.finished = true;
+        this.onComplete(result, !this.finalResult);
+    }
 
     async run() {
         if (this.payload.mode === 'flat') {
@@ -300,34 +344,91 @@ class RankSessionModal extends obsidian.Modal {
         const out = emptySections();
         out.done = this.payload.sections.done;
         out.inbox = this.payload.sections.inbox;
+        this.matrixOut = out;
         for (const q of QUADRANTS) {
             this.currentQuadrantLabel = q.heading;
+            this.currentQuadrantKey = q.key;
             const items = this.payload.sections[q.key];
             if (items.length < 2) { out[q.key] = items; continue; }
             out[q.key] = await this.mergeSort(items);
         }
+        this.currentQuadrantKey = null;
         this.renderResults({ mode: 'matrix', sections: out });
     }
 
+    // Bottom-up merge sort so an interrupted session has usable state: runs
+    // already merged this pass, the merge in flight, and runs not yet reached.
     async mergeSort(arr) {
-        if (arr.length <= 1) return arr;
-        const mid = Math.floor(arr.length / 2);
-        const left  = await this.mergeSort(arr.slice(0, mid));
-        const right = await this.mergeSort(arr.slice(mid));
-        return this.merge(left, right);
+        let runs = arr.map(x => [x]);
+        while (runs.length > 1) {
+            const next = [];
+            for (let i = 0; i < runs.length; i += 2) {
+                this.sortState = { done: next, pending: runs.slice(i), inflight: null };
+                if (i + 1 === runs.length) { next.push(runs[i]); continue; }
+                next.push(await this.merge(runs[i], runs[i + 1]));
+            }
+            runs = next;
+        }
+        this.sortState = null;
+        return runs[0];
     }
 
     async merge(left, right) {
         const result = [];
         let i = 0, j = 0;
+        const inflight = { result, left, right, i: 0, j: 0 };
+        if (this.sortState) this.sortState.inflight = inflight;
         while (i < left.length && j < right.length) {
             const leftWins = await this.askCompare(left[i], right[j]);
             if (leftWins) result.push(left[i++]);
             else result.push(right[j++]);
+            inflight.i = i;
+            inflight.j = j;
         }
         while (i < left.length) result.push(left[i++]);
         while (j < right.length) result.push(right[j++]);
         return result;
+    }
+
+    // The best full ordering an interrupted sort supports: merged runs first,
+    // then the in-flight merge (its merged prefix plus both unmerged tails),
+    // then untouched runs. Every item appears exactly once.
+    bestEffortSorted() {
+        const s = this.sortState;
+        if (!s) return null;
+        const out = s.done.flat();
+        if (s.inflight) {
+            out.push(...s.inflight.result);
+            out.push(...s.inflight.left.slice(s.inflight.i));
+            out.push(...s.inflight.right.slice(s.inflight.j));
+            out.push(...s.pending.slice(2).flat());
+        } else {
+            out.push(...s.pending.flat());
+        }
+        return out;
+    }
+
+    buildPartialResult() {
+        if (this.payload.mode === 'flat') {
+            const items = this.bestEffortSorted();
+            return items ? { mode: 'flat', items } : null;
+        }
+        if (!this.matrixOut) return null;
+        const sections = emptySections();
+        sections.done = this.payload.sections.done;
+        sections.inbox = this.payload.sections.inbox;
+        let reached = false;
+        for (const q of QUADRANTS) {
+            if (q.key === this.currentQuadrantKey) {
+                reached = true;
+                sections[q.key] = this.bestEffortSorted() || this.payload.sections[q.key];
+            } else {
+                // Quadrants before the current one are fully sorted in
+                // matrixOut; the ones after haven't been touched.
+                sections[q.key] = reached ? this.payload.sections[q.key] : this.matrixOut[q.key];
+            }
+        }
+        return { mode: 'matrix', sections };
     }
 
     askCompare(a, b) {
@@ -371,9 +472,12 @@ class RankSessionModal extends obsidian.Modal {
             cls: 'ordinal-skip'
         });
         skipBtn.addEventListener('click', () => resolve(true));
+
+        closeHint(contentEl, 'Close anytime — comparisons made so far are saved.');
     }
 
     renderResults(result) {
+        this.finalResult = result;
         const { contentEl } = this;
         contentEl.empty();
         contentEl.createEl('h2', { text: '🏆 Ranking Complete' });
@@ -401,6 +505,7 @@ class RankSessionModal extends obsidian.Modal {
             cls: 'ordinal-save-btn'
         });
         saveBtn.addEventListener('click', () => {
+            this.finished = true;
             this.onComplete(result);
             this.close();
         });
@@ -420,13 +525,55 @@ class AddItemModal extends obsidian.Modal {
         this.sorted = [];
         this.lo = 0;
         this.hi = 0;
+        this.finished = false;
+        this.searchStarted = false;
+        this.pendingResult = null;  // final result awaiting the save button
     }
 
     onOpen() {
         this.modalEl.addClass('ordinal-modal');
         this.renderInput();
     }
-    onClose() { this.contentEl.empty(); }
+
+    // Closing mid-placement still saves the item as best we can: at the final
+    // screen the exact result; mid-search the midpoint of the range the
+    // answers so far allow; before classification (matrix) into the Inbox.
+    onClose() {
+        this.contentEl.empty();
+        if (this.finished) return;
+        let result = this.pendingResult;
+        let partial = false;
+        if (!result && this.newItem.text) {
+            partial = true;
+            if (this.searchStarted) {
+                const pos = Math.min(
+                    Math.max(Math.floor((this.lo + this.hi + 1) / 2), 0),
+                    this.sorted.length
+                );
+                const items = [...this.sorted];
+                items.splice(pos, 0, this.newItem);
+                result = this.payload.mode === 'flat'
+                    ? { mode: 'flat', items }
+                    : { mode: 'matrix', sections: this.sectionsWith(this.targetQuadrant.key, items) };
+            } else if (this.payload.mode === 'matrix') {
+                const inbox = [...this.payload.sections.inbox, this.newItem];
+                result = { mode: 'matrix', sections: this.sectionsWith('inbox', inbox) };
+            }
+        }
+        if (!result) return;
+        this.finished = true;
+        this.onComplete(result, partial);
+    }
+
+    // A copy of the payload's sections with one of them replaced.
+    sectionsWith(key, items) {
+        const sections = {};
+        for (const k of Object.keys(this.payload.sections)) {
+            sections[k] = [...this.payload.sections[k]];
+        }
+        sections[key] = items;
+        return sections;
+    }
 
     renderInput() {
         const { contentEl } = this;
@@ -480,6 +627,7 @@ class AddItemModal extends obsidian.Modal {
             text: 'Urgent things have a hard deadline or consequence if delayed.',
             cls: 'ordinal-hint'
         });
+        closeHint(contentEl, 'Close anytime — the item is captured in the Inbox.');
 
         const grid = contentEl.createDiv({ cls: 'ordinal-grid' });
         const yes = grid.createEl('button', { text: 'Yes, urgent', cls: 'ordinal-choice' });
@@ -498,6 +646,7 @@ class AddItemModal extends obsidian.Modal {
             text: 'Important things move you toward your goals or values.',
             cls: 'ordinal-hint'
         });
+        closeHint(contentEl, 'Close anytime — the item is captured in the Inbox.');
 
         const grid = contentEl.createDiv({ cls: 'ordinal-grid' });
         const yes = grid.createEl('button', { text: 'Yes, important', cls: 'ordinal-choice' });
@@ -509,6 +658,7 @@ class AddItemModal extends obsidian.Modal {
 
     startFlat() {
         this.sorted = [...this.payload.items];
+        this.searchStarted = true;
         this.lo = 0;
         this.hi = this.sorted.length - 1;
         if (this.sorted.length === 0) this.finish(0);
@@ -519,6 +669,7 @@ class AddItemModal extends obsidian.Modal {
         const q = findQuadrant(this.urgent, important);
         this.targetQuadrant = q;
         this.sorted = [...this.payload.sections[q.key]];
+        this.searchStarted = true;
         this.lo = 0;
         this.hi = this.sorted.length - 1;
         if (this.sorted.length === 0) this.finish(0);
@@ -556,6 +707,8 @@ class AddItemModal extends obsidian.Modal {
 
         btnNew.addEventListener('click', () => { this.hi = mid - 1; this.renderCompare(); });
         btnOld.addEventListener('click', () => { this.lo = mid + 1; this.renderCompare(); });
+
+        closeHint(contentEl, 'Close anytime — the item is saved at its best-known spot.');
     }
 
     finish(insertPosition) {
@@ -563,6 +716,10 @@ class AddItemModal extends obsidian.Modal {
         const sortedWithNew = [...this.sorted];
         sortedWithNew.splice(insertPosition, 0, this.newItem);
         const rank = insertPosition + 1;
+
+        this.pendingResult = this.payload.mode === 'flat'
+            ? { mode: 'flat', items: sortedWithNew }
+            : { mode: 'matrix', sections: this.sectionsWith(placedQuadrant.key, sortedWithNew) };
 
         const { contentEl } = this;
         contentEl.empty();
@@ -588,20 +745,8 @@ class AddItemModal extends obsidian.Modal {
             cls: 'ordinal-save-btn'
         });
         saveBtn.addEventListener('click', () => {
-            if (this.payload.mode === 'flat') {
-                this.onComplete({ mode: 'flat', items: sortedWithNew });
-            } else {
-                const newSections = {
-                    inbox: [...this.payload.sections.inbox],
-                    Q1: [...this.payload.sections.Q1],
-                    Q2: [...this.payload.sections.Q2],
-                    Q3: [...this.payload.sections.Q3],
-                    Q4: [...this.payload.sections.Q4],
-                    done: [...this.payload.sections.done],
-                };
-                newSections[placedQuadrant.key] = sortedWithNew;
-                this.onComplete({ mode: 'matrix', sections: newSections });
-            }
+            this.finished = true;
+            this.onComplete(this.pendingResult);
             this.close();
         });
     }
@@ -627,6 +772,7 @@ class TriageInboxModal extends obsidian.Modal {
         }
         this.idx = 0;
         this.placed = new Set();
+        this.finished = false;
         this.urgent = null;
         this.targetQuadrant = null;
         // Binary-search placement state for the current item.
@@ -639,7 +785,21 @@ class TriageInboxModal extends obsidian.Modal {
         this.modalEl.addClass('ordinal-modal');
         this.nextItem();
     }
-    onClose() { this.contentEl.empty(); }
+
+    // Closing mid-triage keeps every fully placed item; the current item and
+    // anything not yet reached stay in the Inbox for a later session.
+    onClose() {
+        this.contentEl.empty();
+        if (this.finished) return;
+        if (this.placed.size === 0) return;
+        this.finished = true;
+        const remaining = this.queue.slice(this.idx);
+        if (this.payload.mode === 'flat') {
+            this.onComplete({ mode: 'flat', items: this.items, inbox: remaining }, true);
+        } else {
+            this.onComplete({ mode: 'matrix', sections: { ...this.sections, inbox: remaining } }, true);
+        }
+    }
 
     current() { return this.queue[this.idx]; }
     progressLabel() { return `Inbox item ${this.idx + 1} of ${this.queue.length}`; }
@@ -668,6 +828,8 @@ class TriageInboxModal extends obsidian.Modal {
         const no  = grid.createEl('button', { text: 'No, not urgent', cls: 'ordinal-choice' });
         yes.addEventListener('click', () => { this.urgent = true;  this.askImportant(); });
         no .addEventListener('click', () => { this.urgent = false; this.askImportant(); });
+
+        closeHint(contentEl, 'Close anytime — placed items are saved; the rest stay in the Inbox.');
     }
 
     askImportant() {
@@ -684,6 +846,8 @@ class TriageInboxModal extends obsidian.Modal {
         const no  = grid.createEl('button', { text: 'No, not important', cls: 'ordinal-choice' });
         yes.addEventListener('click', () => this.classify(true));
         no .addEventListener('click', () => this.classify(false));
+
+        closeHint(contentEl, 'Close anytime — placed items are saved; the rest stay in the Inbox.');
     }
 
     classify(important) {
@@ -723,6 +887,8 @@ class TriageInboxModal extends obsidian.Modal {
 
         btnNew.addEventListener('click', () => { this.hi = mid - 1; this.renderCompare(); });
         btnOld.addEventListener('click', () => { this.lo = mid + 1; this.renderCompare(); });
+
+        closeHint(contentEl, 'Close anytime — placed items are saved; the rest stay in the Inbox.');
     }
 
     place(insertPosition) {
@@ -774,8 +940,9 @@ class TriageInboxModal extends obsidian.Modal {
             cls: 'ordinal-save-btn'
         });
         saveBtn.addEventListener('click', () => {
+            this.finished = true;
             if (this.payload.mode === 'flat') {
-                this.onComplete({ mode: 'flat', items: this.items, clearInbox: true });
+                this.onComplete({ mode: 'flat', items: this.items, inbox: [] });
             } else {
                 this.onComplete({ mode: 'matrix', sections: this.sections });
             }
@@ -794,6 +961,7 @@ class ConvertModal extends obsidian.Modal {
         this.onComplete = onComplete;
         this.idx = 0;
         this.urgent = null;
+        this.finished = false;
         this.classified = emptySections();
         this.classified.done = this.doneItems;
         this.classified.inbox = flatPayload.inbox || [];
@@ -804,7 +972,20 @@ class ConvertModal extends obsidian.Modal {
         if (this.items.length === 0) this.renderResults();
         else this.askUrgent();
     }
-    onClose() { this.contentEl.empty(); }
+
+    // Closing mid-conversion keeps the classifications made so far; items not
+    // yet classified land in the Inbox to be triaged later.
+    onClose() {
+        this.contentEl.empty();
+        if (this.finished) return;
+        if (this.idx === 0) return;
+        this.finished = true;
+        const sections = {
+            ...this.classified,
+            inbox: [...this.classified.inbox, ...this.items.slice(this.idx)],
+        };
+        this.onComplete({ mode: 'matrix', sections }, this.idx < this.items.length);
+    }
 
     askUrgent() {
         const item = this.items[this.idx];
@@ -820,6 +1001,8 @@ class ConvertModal extends obsidian.Modal {
         const no  = grid.createEl('button', { text: 'No, not urgent', cls: 'ordinal-choice' });
         yes.addEventListener('click', () => { this.urgent = true;  this.askImportant(); });
         no .addEventListener('click', () => { this.urgent = false; this.askImportant(); });
+
+        closeHint(contentEl, 'Close anytime — classified items are saved; the rest go to the Inbox.');
     }
 
     askImportant() {
@@ -836,6 +1019,8 @@ class ConvertModal extends obsidian.Modal {
         const no  = grid.createEl('button', { text: 'No, not important', cls: 'ordinal-choice' });
         yes.addEventListener('click', () => this.place(true));
         no .addEventListener('click', () => this.place(false));
+
+        closeHint(contentEl, 'Close anytime — classified items are saved; the rest go to the Inbox.');
     }
 
     place(important) {
@@ -868,9 +1053,175 @@ class ConvertModal extends obsidian.Modal {
 
         const saveBtn = contentEl.createEl('button', { text: '💾 Save to note', cls: 'ordinal-save-btn' });
         saveBtn.addEventListener('click', () => {
+            this.finished = true;
             this.onComplete({ mode: 'matrix', sections: this.classified });
             this.close();
         });
+    }
+}
+
+// ── Claude prioritization: classify & rank the whole list in one shot ───────
+
+class ClaudePrioritizeModal extends obsidian.Modal {
+    constructor(app, payload, anthropic, onComplete) {
+        super(app);
+        this.payload = payload;
+        this.anthropic = anthropic;
+        this.onComplete = onComplete;
+        this.finished = false;
+
+        // Every active item (quadrants or ranked list, plus the Inbox),
+        // numbered so Claude can answer with indices instead of echoing text.
+        this.entries = [];
+        if (payload.mode === 'flat') {
+            for (const item of payload.items) this.entries.push({ item, context: 'ranked list' });
+            for (const item of payload.inbox) this.entries.push({ item, context: 'Inbox (unprioritized)' });
+            this.doneItems = payload.done;
+        } else {
+            for (const q of QUADRANTS) {
+                for (const item of payload.sections[q.key]) this.entries.push({ item, context: q.heading });
+            }
+            for (const item of payload.sections.inbox) this.entries.push({ item, context: 'Inbox (unprioritized)' });
+            this.doneItems = payload.sections.done;
+        }
+    }
+
+    onOpen() {
+        this.modalEl.addClass('ordinal-modal');
+        this.renderLoading();
+        this.run();
+    }
+    // Nothing is written unless the proposal is explicitly saved — closing
+    // discards it (unlike the interactive sessions, no user decisions are lost).
+    onClose() { this.contentEl.empty(); }
+
+    renderLoading() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', { text: '🤖 Asking Claude…' });
+        contentEl.createEl('p', {
+            text: `Sending ${this.entries.length} items to ${this.anthropic.model} to classify into Eisenhower quadrants and rank by priority.`,
+            cls: 'ordinal-hint'
+        });
+        closeHint(contentEl, 'Close to cancel — nothing is written without your OK.');
+    }
+
+    renderError(message) {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', { text: 'Something went wrong' });
+        contentEl.createEl('p', { text: message, cls: 'ordinal-hint' });
+        const retry = contentEl.createEl('button', { text: 'Retry', cls: 'ordinal-save-btn' });
+        retry.addEventListener('click', () => { this.renderLoading(); this.run(); });
+    }
+
+    buildPrompt() {
+        const system =
+            'You are prioritizing a personal TODO list into an Eisenhower matrix. Quadrants: ' +
+            'Q1 = Do (urgent & important), Q2 = Schedule (important, not urgent), ' +
+            'Q3 = Delegate (urgent, not important), Q4 = Delete (neither urgent nor important). ' +
+            'You will receive a numbered list of tasks. Assign EVERY task number to exactly one quadrant ' +
+            'and order each quadrant from highest to lowest priority. ' +
+            'Each task may note where it currently sits — treat that as a mild prior, not a constraint. ' +
+            'If recently completed tasks are provided, their #urgent/#important tags show how the user ' +
+            'tends to classify similar work. ' +
+            'Respond with ONLY a JSON object of the form {"Q1":[3,0],"Q2":[2],"Q3":[],"Q4":[1]} — ' +
+            'no prose, no code fences. Every input number must appear exactly once across the four arrays.';
+
+        const taskLines = this.entries.map((e, i) => {
+            let s = `${i}. ${e.item.text} (currently: ${e.context})`;
+            for (const child of e.item.children || []) s += `\n${child}`;
+            return s;
+        });
+        let user = `Tasks to prioritize:\n\n${taskLines.join('\n')}`;
+        const recentDone = this.doneItems.slice(-30);
+        if (recentDone.length > 0) {
+            user += `\n\nRecently completed (for calibration only — do not include these numbers):\n` +
+                recentDone.map(d => `- ${d.text}`).join('\n');
+        }
+        return { system, user };
+    }
+
+    async run() {
+        const { system, user } = this.buildPrompt();
+        let res;
+        try {
+            res = await callClaude(this.anthropic.apiKey, this.anthropic.model, system, user);
+        } catch (e) {
+            console.error('Drake\'s Factotum — Claude request failed', e);
+            this.renderError('Claude could not be reached (network error).');
+            return;
+        }
+        if (!res.ok) {
+            console.error('Drake\'s Factotum — Claude API error', res.status);
+            this.renderError(`Claude API error (HTTP ${res.status}).`);
+            return;
+        }
+        const sections = this.parseAssignment(res.text);
+        if (!sections) {
+            console.error('Drake\'s Factotum — unparseable Claude response', res.text);
+            this.renderError('Claude returned a response that couldn\'t be parsed. Retry?');
+            return;
+        }
+        this.renderProposal(sections);
+    }
+
+    parseAssignment(text) {
+        const m = text.match(/\{[\s\S]*\}/);
+        if (!m) return null;
+        let obj;
+        try { obj = JSON.parse(m[0]); } catch (e) { return null; }
+        const used = new Set();
+        const sections = emptySections();
+        sections.done = this.doneItems;
+        for (const q of QUADRANTS) {
+            const arr = Array.isArray(obj[q.key]) ? obj[q.key] : [];
+            for (const n of arr) {
+                const i = Number(n);
+                if (!Number.isInteger(i) || i < 0 || i >= this.entries.length || used.has(i)) continue;
+                used.add(i);
+                sections[q.key].push(this.entries[i].item);
+            }
+        }
+        // Anything Claude failed to place stays in the Inbox instead of
+        // silently vanishing from the note.
+        for (let i = 0; i < this.entries.length; i++) {
+            if (!used.has(i)) sections.inbox.push(this.entries[i].item);
+        }
+        return sections;
+    }
+
+    renderProposal(sections) {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h2', { text: '🤖 Claude\'s Proposal' });
+
+        for (const q of QUADRANTS) {
+            contentEl.createEl('h3', { text: q.heading, cls: 'ordinal-quadrant-header' });
+            const items = sections[q.key];
+            if (items.length === 0) {
+                contentEl.createEl('p', { text: '(empty)', cls: 'ordinal-hint' });
+            } else {
+                const ol = contentEl.createEl('ol', { cls: 'ordinal-results-list' });
+                for (const item of items) ol.createEl('li').createSpan({ text: item.text });
+            }
+        }
+        if (sections.inbox.length > 0) {
+            contentEl.createEl('h3', { text: 'Left in Inbox (unassigned by Claude)', cls: 'ordinal-quadrant-header' });
+            const ol = contentEl.createEl('ol', { cls: 'ordinal-results-list' });
+            for (const item of sections.inbox) ol.createEl('li').createSpan({ text: item.text });
+        }
+
+        const saveBtn = contentEl.createEl('button', {
+            text: '💾 Save to note',
+            cls: 'ordinal-save-btn'
+        });
+        saveBtn.addEventListener('click', () => {
+            this.finished = true;
+            this.onComplete({ mode: 'matrix', sections });
+            this.close();
+        });
+        closeHint(contentEl, 'Close without saving to discard the proposal.');
     }
 }
 
@@ -878,7 +1229,7 @@ class ConvertModal extends obsidian.Modal {
 
 function computeResult(originalContent, result) {
     if (result.mode === 'flat') {
-        return serializeFlat(originalContent, result.items, !!result.clearInbox);
+        return serializeFlat(originalContent, result.items, result.inbox || null);
     }
     return serializeMatrix(originalContent, result.sections);
 }
@@ -1150,9 +1501,11 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                     new obsidian.Notice('Drake\'s Factotum: need at least 2 list items to compare.');
                     return;
                 }
-                new RankSessionModal(this.app, parsed, (result) => {
+                new RankSessionModal(this.app, parsed, (result, partial) => {
                     applyResult(editor, content, result);
-                    new obsidian.Notice('Drake\'s Factotum: rankings saved ✓');
+                    new obsidian.Notice(partial
+                        ? 'Drake\'s Factotum: session interrupted — progress saved; run again to finish.'
+                        : 'Drake\'s Factotum: rankings saved ✓');
                 }).open();
             }
         });
@@ -1182,9 +1535,11 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 }
                 const content = await target.read();
                 const parsed  = parseNote(content);
-                new AddItemModal(this.app, parsed, async (result) => {
+                new AddItemModal(this.app, parsed, async (result, partial) => {
                     await target.write(computeResult(content, result));
-                    new obsidian.Notice('Drake\'s Factotum: item added ✓');
+                    new obsidian.Notice(partial
+                        ? 'Drake\'s Factotum: interrupted — item saved with best-effort placement ✓'
+                        : 'Drake\'s Factotum: item added ✓');
                 }).open();
             }
         });
@@ -1200,9 +1555,37 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                     new obsidian.Notice('Drake\'s Factotum: no items under an "Inbox" heading in this note.');
                     return;
                 }
-                new TriageInboxModal(this.app, parsed, (result) => {
+                new TriageInboxModal(this.app, parsed, (result, partial) => {
                     applyResult(editor, content, result);
-                    new obsidian.Notice('Drake\'s Factotum: inbox triaged ✓');
+                    if (partial) {
+                        const left = (result.mode === 'flat' ? result.inbox : result.sections.inbox).length;
+                        new obsidian.Notice(`Drake's Factotum: triage interrupted — placed items saved, ${left} still in the Inbox.`);
+                    } else {
+                        new obsidian.Notice('Drake\'s Factotum: inbox triaged ✓');
+                    }
+                }).open();
+            }
+        });
+
+        this.addCommand({
+            id: 'factotum-claude-prioritize',
+            name: 'Prioritize with Claude (whole list → Eisenhower matrix)',
+            editorCallback: (editor) => {
+                if (!this.settings.anthropic.apiKey) {
+                    new obsidian.Notice('Drake\'s Factotum: set an Anthropic API key in settings first.');
+                    return;
+                }
+                const content = editor.getValue();
+                const parsed  = parseNote(content);
+                const count = totalActiveItems(parsed) +
+                    (parsed.mode === 'flat' ? parsed.inbox.length : parsed.sections.inbox.length);
+                if (count === 0) {
+                    new obsidian.Notice('Drake\'s Factotum: no items to prioritize.');
+                    return;
+                }
+                new ClaudePrioritizeModal(this.app, parsed, this.settings.anthropic, (result) => {
+                    applyResult(editor, content, result);
+                    new obsidian.Notice('Drake\'s Factotum: Claude\'s prioritization saved ✓');
                 }).open();
             }
         });
@@ -1221,9 +1604,11 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                     new obsidian.Notice('Drake\'s Factotum: no items to classify.');
                     return;
                 }
-                new ConvertModal(this.app, parsed, (result) => {
+                new ConvertModal(this.app, parsed, (result, partial) => {
                     applyResult(editor, content, result);
-                    new obsidian.Notice('Drake\'s Factotum: converted to Eisenhower matrix ✓');
+                    new obsidian.Notice(partial
+                        ? 'Drake\'s Factotum: conversion interrupted — classified items placed; the rest are in the Inbox.'
+                        : 'Drake\'s Factotum: converted to Eisenhower matrix ✓');
                 }).open();
             }
         });
@@ -1748,7 +2133,7 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
             .setHeading();
 
         containerEl.createEl('p', {
-            text: 'The periodic reviews below (weekly, monthly, quarterly, yearly) summarize your daily notes with Claude via the Anthropic API (a few cents per run) and share this API key and model.',
+            text: 'The "Prioritize with Claude" command and the periodic reviews below (weekly, monthly, quarterly, yearly) use Claude via the Anthropic API (a few cents per run) and share this API key and model.',
             cls: 'ordinal-hint',
         });
 

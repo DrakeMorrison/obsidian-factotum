@@ -190,6 +190,14 @@ body.is-mobile .modal.ordinal-modal {
     line-height: 1.5;
 }
 
+/* "Close anytime" reassurance footer on session screens */
+.ordinal-close-hint {
+    margin: 16px 0 0;
+    font-size: 0.75em;
+    color: var(--text-faint);
+    text-align: center;
+}
+
 /* Quadrant label badge above comparison header */
 .ordinal-quadrant-label {
     display: inline-block;

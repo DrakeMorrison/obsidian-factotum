@@ -57,6 +57,31 @@ Add an `## Inbox` heading anywhere in your TODO note (top or bottom — it stays
 
 Each inbox item is walked through the usual flow — in a matrix note you classify it (urgent? important?) and then binary-search-place it within its quadrant; in a flat note it's binary-search-placed straight into the ranked list. On save, every item lands in its spot and the Inbox is emptied (the heading stays, ready for the next capture).
 
+### Stopping partway — progress is saved
+
+Every interactive session can be closed at any point (Esc, the ✕, or clicking outside) without losing the decisions you've already made:
+
+- **Ranking session** — comparisons made so far are kept: fully merged groups (and fully sorted quadrants) stay in their decided order, and everything not yet compared keeps its current relative order. Run the session again later to finish the job.
+- **Triage inbox** — items you've already placed are saved into position; the current item and anything you didn't reach stay in the Inbox for next time.
+- **Add new item** — mid-placement, the item is saved at the midpoint of the range your answers have narrowed it to; in a matrix note, closing before classifying drops it into the Inbox instead.
+- **Convert to matrix** — items you've classified land in their quadrants; the rest go to the Inbox.
+
+Closing before making any decision leaves the note untouched. Partial saves go through the editor, so `Ctrl/Cmd+Z` undoes one if you actually meant to cancel.
+
+### Prioritize with Claude
+
+Instead of answering every comparison yourself, you can hand the whole list to Claude:
+
+> **Drake's Factotum: Prioritize with Claude (whole list → Eisenhower matrix)**
+
+It sends every active item — quadrant contents, ranked list, and Inbox alike — to the Anthropic API, which classifies each into an Eisenhower quadrant and orders each quadrant by priority. You review the proposal in a modal before anything is written; **Save to note** applies it (a flat note becomes a matrix note), closing discards it. Items Claude fails to place are left in the Inbox rather than dropped. Requires the **Anthropic API key** in settings (shared with the periodic reviews); one API call per run.
+
+To help Claude match *your* sense of urgency, recently completed items are included as calibration — see the tagging below.
+
+### Done items remember their quadrant
+
+In a matrix note, when a task you check off (`- [x]`) migrates to the `## Done` section on the next save, it's tagged with the quadrant it came from: `#urgent #important` from **Do**, `#important` from **Schedule**, `#urgent` from **Delegate**, nothing from **Delete**. The tags make your history searchable and give Claude concrete examples of how you classify work when it prioritizes for you. Already-tagged items are never double-tagged.
+
 ### Checked-off tasks
 
 Lines like `- [x] done thing` are skipped — they don't appear in comparisons and stay put when the list is rewritten. Active tasks (`- [ ] thing`) and plain bullets (`- thing`) are both ranked.
