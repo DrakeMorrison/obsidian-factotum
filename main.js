@@ -12,10 +12,12 @@ const QUADRANTS = [
 ];
 const DONE_HEADING = 'Done';
 const INBOX_HEADING = 'Inbox';
+const TODO_HEADING = 'TODO';
 
 function classifyHeading(text) {
     const t = text.trim().toLowerCase();
     if (/^inbox\b/.test(t)) return 'inbox';
+    if (/^todo\b/.test(t)) return 'todo';
     if (/^done\b/.test(t)) return 'done';
     if (/^do\b/.test(t))       return 'Q1';
     if (/^schedule\b/.test(t)) return 'Q2';
@@ -47,14 +49,14 @@ function withDoneTags(text, quadrant) {
 function parseNote(content) {
     const lines = content.split('\n');
 
-    // Detect matrix mode: any heading line that classifies as a quadrant or
-    // done. An Inbox heading alone doesn't make a note a matrix — a flat
-    // ranked list can have an inbox too.
+    // Detect matrix mode: any heading line that classifies as a quadrant.
+    // Inbox, TODO, and Done headings don't make a note a matrix — a flat
+    // ranked list has those sections too.
     let matrixMode = false;
     for (const line of lines) {
         const m = line.match(/^#{1,6}\s+(.+)$/);
         const cls = m ? classifyHeading(m[1]) : null;
-        if (cls !== null && cls !== 'inbox') { matrixMode = true; break; }
+        if (cls !== null && QUADRANTS.some(q => q.key === cls)) { matrixMode = true; break; }
     }
 
     if (!matrixMode) {
@@ -121,7 +123,7 @@ function parseNote(content) {
             let isTask = false;
             const taskMatch = text.match(/^\[ \]\s+(.+)$/);
             if (taskMatch) { isTask = true; text = taskMatch[1]; }
-            const bucket = (section === 'preamble' || section === 'done') ? 'Q2' : section;
+            const bucket = (section === 'preamble' || section === 'todo' || section === 'done') ? 'Q2' : section;
             lastItem = { text, isTask, children: [] };
             sections[bucket].push(lastItem);
             continue;
@@ -149,15 +151,23 @@ function renderItemBlock(item) {
 // (ordinary saves — inbox items are unranked and stay put); an array rewrites
 // the section to exactly those items (a triage passes what's still unplaced,
 // or [] when everything was placed).
+//
+// Whatever the note looked like before, the save lands in the canonical
+// layout: Inbox at the top, the ranked list under a TODO heading, Done at
+// the bottom. Prose outside those sections stays where it was. The TODO
+// heading only appears when there's an Inbox section to terminate (or the
+// note already had one), and Done only when there are done items to hold
+// (or the heading already existed) — a plain list stays a plain list.
 function serializeFlat(content, sortedItems, inboxItems = null) {
     const replacements = sortedItems.map(renderItemBlock);
 
     const lines = content.split('\n');
-    const newLines = [];
+    const body = [];
+    const inboxBlock = [];   // captured contents of the original Inbox section
     const doneBlocks = [];
+    let hadInbox = false, hadTodo = false, hadDone = false;
+    let firstSortedIdx = -1;
     let lastSortedIdx = -1;
-    let inboxHeadingIdx = -1;
-    let inboxRewritten = false;
     let inInbox = false;
     let idx = 0;
     let i = 0;
@@ -166,75 +176,97 @@ function serializeFlat(content, sortedItems, inboxItems = null) {
         const line = lines[i];
         const h = line.match(/^#{1,6}\s+(.+)$/);
         if (h) {
-            inInbox = classifyHeading(h[1]) === 'inbox';
-            if (inInbox && inboxHeadingIdx < 0) inboxHeadingIdx = newLines.length;
-            newLines.push(line);
-            if (inInbox && inboxItems && !inboxRewritten) {
-                inboxRewritten = true;
-                for (const item of inboxItems) newLines.push(...renderItemBlock(item));
-            }
+            const cls = classifyHeading(h[1]);
+            inInbox = cls === 'inbox';
+            // Recognized section headings are re-emitted in canonical
+            // position below; everything else stays in place.
+            if (cls === 'inbox') { hadInbox = true; i++; continue; }
+            if (cls === 'todo')  { hadTodo = true;  i++; continue; }
+            if (cls === 'done')  { hadDone = true;  i++; continue; }
+            body.push(line);
             i++;
         } else if (/^[-*+] \[[xX]\]\s/.test(line)) {
-            // Done item: keep its block verbatim and stash it for the tail.
+            // Done item: keep its block verbatim and stash it for the Done section.
             const block = [line];
             i++;
             while (i < lines.length && /^\s+\S/.test(lines[i])) { block.push(lines[i]); i++; }
             doneBlocks.push(block);
-        } else if (inInbox && /^[-*+] /.test(line)) {
-            // Inbox bullets are unranked and don't participate in sorting:
-            // leave them where they are — unless the caller is rewriting the
-            // Inbox, in which case the originals were rendered above.
-            const block = [line];
-            i++;
-            while (i < lines.length && /^\s+\S/.test(lines[i])) { block.push(lines[i]); i++; }
-            if (!inboxItems) newLines.push(...block);
+        } else if (inInbox) {
+            // The Inbox section travels to the top as-is. Its bullets are
+            // unranked and don't participate in sorting — unless the caller
+            // is rewriting the Inbox, in which case they're replaced.
+            if (/^[-*+] /.test(line)) {
+                const block = [line];
+                i++;
+                while (i < lines.length && /^\s+\S/.test(lines[i])) { block.push(lines[i]); i++; }
+                if (!inboxItems) inboxBlock.push(...block);
+            } else {
+                if (line.trim() !== '') inboxBlock.push(line);
+                i++;
+            }
         } else if (/^[-*+] /.test(line)) {
             // Active bullet: swap in the next ranked block, dropping the original
             // nested lines (they ride along inside the replacement block).
             i++;
             while (i < lines.length && /^\s+\S/.test(lines[i])) i++;
             if (idx < replacements.length) {
-                newLines.push(...replacements[idx++]);
-                lastSortedIdx = newLines.length - 1;
+                if (firstSortedIdx < 0) firstSortedIdx = body.length;
+                body.push(...replacements[idx++]);
+                lastSortedIdx = body.length - 1;
             }
         } else {
-            newLines.push(line);
+            body.push(line);
             i++;
         }
     }
 
-    const tail = [...replacements.slice(idx), ...doneBlocks].flat();
-    if (tail.length > 0) {
-        // Prefer right after the last ranked item; with no ranked items at all
-        // (e.g. a note whose only bullets were in the Inbox), land above the
-        // Inbox heading so placed items don't end up back inside it.
-        const insertAt = lastSortedIdx >= 0 ? lastSortedIdx + 1
-            : inboxHeadingIdx >= 0 ? inboxHeadingIdx
-            : newLines.length;
-        newLines.splice(insertAt, 0, ...tail);
+    // Ranked items beyond the original bullet slots (a placement added items)
+    // go right after the last ranked line.
+    if (idx < replacements.length) {
+        const extra = replacements.slice(idx).flat();
+        const at = lastSortedIdx >= 0 ? lastSortedIdx + 1 : body.length;
+        if (firstSortedIdx < 0) firstSortedIdx = at;
+        body.splice(at, 0, ...extra);
     }
 
-    return newLines.join('\n');
+    // Inbox (and the TODO heading that ends it) land right above the first
+    // ranked item, so prose above the list keeps acting as a preamble.
+    const newInbox = inboxItems || [];
+    const emitInbox = hadInbox || newInbox.length > 0 || inboxBlock.length > 0;
+    const head = [];
+    if (emitInbox) {
+        head.push(`## ${INBOX_HEADING}`);
+        for (const item of newInbox) head.push(...renderItemBlock(item));
+        head.push(...inboxBlock);
+        head.push('');
+    }
+    if (emitInbox || hadTodo) head.push(`## ${TODO_HEADING}`);
+    if (head.length > 0) {
+        const at = firstSortedIdx >= 0 ? firstSortedIdx : body.length;
+        if (at > 0 && body[at - 1].trim() !== '') head.unshift('');
+        body.splice(at, 0, ...head);
+    }
+
+    if (hadDone || doneBlocks.length > 0) {
+        while (body.length && body[body.length - 1].trim() === '') body.pop();
+        body.push('');
+        body.push(`## ${DONE_HEADING}`);
+        for (const block of doneBlocks) body.push(...block);
+    }
+
+    // Extracting headings can leave doubled blank lines behind — collapse them.
+    const out = [];
+    for (const line of body) {
+        if (line.trim() === '' && out.length && out[out.length - 1].trim() === '') continue;
+        out.push(line);
+    }
+    return out.join('\n');
 }
 
-function serializeMatrix(originalContent, sections) {
-    // Preserve everything above the first recognized heading verbatim, and
-    // note whether the note keeps its Inbox above the quadrants or below Done
-    // so the rewrite leaves it where the user put it.
-    const lines = originalContent.split('\n');
+// Everything above the first recognized heading, minus top-level bullet
+// blocks — those were parsed into sections and re-render below the preamble.
+function extractPreamble(lines) {
     const preamble = [];
-    let hadInbox = false;
-    let inboxAtTop = false;
-    let sawOtherHeading = false;
-    for (const line of lines) {
-        const m = line.match(/^#{1,6}\s+(.+)$/);
-        const cls = m ? classifyHeading(m[1]) : null;
-        if (cls === 'inbox') { hadInbox = true; if (!sawOtherHeading) inboxAtTop = true; }
-        else if (cls !== null) sawOtherHeading = true;
-    }
-    // Bullets above the first recognized heading were parsed into sections
-    // (Q2, done, …) and will be re-rendered there — skip them (and their
-    // nested blocks) here so they aren't duplicated in the preamble.
     for (let i = 0; i < lines.length; i++) {
         const m = lines[i].match(/^#{1,6}\s+(.+)$/);
         if (m && classifyHeading(m[1]) !== null) break;
@@ -245,21 +277,35 @@ function serializeMatrix(originalContent, sections) {
         preamble.push(lines[i]);
     }
     while (preamble.length && preamble[preamble.length - 1].trim() === '') preamble.pop();
+    return preamble;
+}
+
+// Rewrite a matrix note in the canonical layout: preamble, Inbox at the top,
+// the four quadrants nested under a TODO heading, Done at the bottom.
+function serializeMatrix(originalContent, sections) {
+    const lines = originalContent.split('\n');
+    let hadInbox = false;
+    for (const line of lines) {
+        const m = line.match(/^#{1,6}\s+(.+)$/);
+        if (m && classifyHeading(m[1]) === 'inbox') { hadInbox = true; break; }
+    }
+    const preamble = extractPreamble(lines);
 
     const out = [];
     if (preamble.length > 0) { out.push(...preamble); out.push(''); }
 
     const inboxItems = sections.inbox || [];
-    const renderInbox = () => {
+    // Keep the (possibly emptied) Inbox heading around as a capture spot.
+    if (hadInbox || inboxItems.length > 0) {
         out.push(`## ${INBOX_HEADING}`);
         for (const item of inboxItems) out.push(...renderItemBlock(item));
         out.push('');
-    };
-    // Keep the (possibly emptied) Inbox heading around as a capture spot.
-    if ((hadInbox || inboxItems.length > 0) && inboxAtTop) renderInbox();
+    }
 
+    out.push(`## ${TODO_HEADING}`);
+    out.push('');
     for (const q of QUADRANTS) {
-        out.push(`## ${q.heading}`);
+        out.push(`### ${q.heading}`);
         for (const item of sections[q.key]) out.push(...renderItemBlock(item));
         out.push('');
     }
@@ -270,9 +316,48 @@ function serializeMatrix(originalContent, sections) {
         if (item.children && item.children.length) out.push(...item.children);
     }
 
-    if ((hadInbox || inboxItems.length > 0) && !inboxAtTop) {
+    return out.join('\n');
+}
+
+// The inverse of serializeMatrix: flatten a matrix note back into a single
+// ranked list, in the same canonical layout — Inbox still at the top, the
+// list under TODO, Done still at the bottom. Quadrant order becomes list
+// order — Do, then Schedule, then Delegate, then Delete — with each
+// quadrant's internal ranking intact. Done items keep their checkboxes (and
+// the #urgent/#important tags they picked up in the matrix, so the
+// classification survives a round-trip).
+function serializeFlatFromMatrix(originalContent, sections) {
+    const lines = originalContent.split('\n');
+    let hadInbox = false, hadTodo = false;
+    for (const line of lines) {
+        const m = line.match(/^#{1,6}\s+(.+)$/);
+        const cls = m ? classifyHeading(m[1]) : null;
+        if (cls === 'inbox') hadInbox = true;
+        if (cls === 'todo') hadTodo = true;
+    }
+    const preamble = extractPreamble(lines);
+
+    const out = [];
+    if (preamble.length > 0) { out.push(...preamble); out.push(''); }
+
+    const inboxItems = sections.inbox || [];
+    const emitInbox = hadInbox || inboxItems.length > 0;
+    if (emitInbox) {
+        out.push(`## ${INBOX_HEADING}`);
+        for (const item of inboxItems) out.push(...renderItemBlock(item));
         out.push('');
-        renderInbox();
+    }
+    if (emitInbox || hadTodo) out.push(`## ${TODO_HEADING}`);
+
+    for (const q of QUADRANTS) {
+        for (const item of sections[q.key]) out.push(...renderItemBlock(item));
+    }
+
+    out.push('');
+    out.push(`## ${DONE_HEADING}`);
+    for (const item of sections.done) {
+        out.push(`- [x] ${item.text}`);
+        if (item.children && item.children.length) out.push(...item.children);
     }
 
     return out.join('\n');
@@ -1610,6 +1695,21 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                         ? 'Factotum: conversion interrupted — classified items placed; the rest are in the Inbox.'
                         : 'Factotum: converted to Eisenhower matrix ✓');
                 }).open();
+            }
+        });
+
+        this.addCommand({
+            id: 'factotum-flatten-matrix',
+            name: 'Convert Eisenhower matrix back to flat list',
+            editorCallback: (editor) => {
+                const content = editor.getValue();
+                const parsed  = parseNote(content);
+                if (parsed.mode !== 'matrix') {
+                    new obsidian.Notice('Factotum: this note is not an Eisenhower matrix.');
+                    return;
+                }
+                editor.setValue(serializeFlatFromMatrix(content, parsed.sections));
+                new obsidian.Notice('Factotum: matrix flattened to a single prioritized list ✓');
             }
         });
 

@@ -51,7 +51,7 @@ By default this works on the note you're currently viewing. To always add to one
 
 ### Inbox: capture now, prioritize later
 
-Add an `## Inbox` heading anywhere in your TODO note (top or bottom — it stays where you put it) and toss unprioritized bullets under it as they occur to you. Inbox items are ignored by ranking sessions — they hold no rank until you triage them. When you're ready:
+Add an `## Inbox` heading to your TODO note and toss unprioritized bullets under it as they occur to you. The Inbox lives at the **top** of the note, with a `## TODO` heading below it marking where the ranked list starts — the plugin adds the TODO heading (and keeps both sections in place) whenever it saves. Inbox items are ignored by ranking sessions — they hold no rank until you triage them. When you're ready:
 
 > **Factotum: Triage inbox (prioritize and place each item)**
 
@@ -78,13 +78,21 @@ It sends every active item — quadrant contents, ranked list, and Inbox alike �
 
 To help Claude match *your* sense of urgency, recently completed items are included as calibration — see the tagging below.
 
+### Undoing the matrix
+
+To collapse a matrix note back into one prioritized list:
+
+> **Factotum: Convert Eisenhower matrix back to flat list**
+
+The quadrant headings disappear and their items become a single ranked list — **Do** first, then **Schedule**, then **Delegate**, then **Delete** — with each quadrant's internal order intact. The note's layout is untouched: the Inbox stays at the top, the list sits under `## TODO`, and `## Done` stays at the bottom with checkboxes and quadrant tags intact. No questions asked; it's deterministic, and `Ctrl/Cmd+Z` undoes it.
+
 ### Done items remember their quadrant
 
 In a matrix note, when a task you check off (`- [x]`) migrates to the `## Done` section on the next save, it's tagged with the quadrant it came from: `#urgent #important` from **Do**, `#important` from **Schedule**, `#urgent` from **Delegate**, nothing from **Delete**. The tags make your history searchable and give Claude concrete examples of how you classify work when it prioritizes for you. Already-tagged items are never double-tagged.
 
 ### Checked-off tasks
 
-Lines like `- [x] done thing` are skipped — they don't appear in comparisons and stay put when the list is rewritten. Active tasks (`- [ ] thing`) and plain bullets (`- thing`) are both ranked.
+Lines like `- [x] done thing` are skipped — they don't appear in comparisons, and on save they collect under a `## Done` heading at the bottom of the note (created if needed). Unchecking an item under `## Done` revives it: the next save ranks it back into the list. Active tasks (`- [ ] thing`) and plain bullets (`- thing`) are both ranked.
 
 ### Nested tasks
 
@@ -155,6 +163,46 @@ Notes are named by period — `2026-W23.md`, `2026-06.md`, `2026-Q2.md`, `2026.m
 ```
 
 That's it. The list is the ranking; nothing extra is written to the file.
+
+Once a note has an Inbox or completed items, every save keeps them in a stable layout — Inbox at the top, the ranked list under `## TODO`, Done at the bottom:
+
+```markdown
+## Inbox
+- something I just thought of
+
+## TODO
+- Build the side project
+- Learn Spanish
+
+## Done
+- [x] Fix the basement
+```
+
+A matrix note follows the same shape, with the quadrants nested under `## TODO`:
+
+```markdown
+## Inbox
+- something I just thought of
+
+## TODO
+
+### Do — Urgent & Important
+- [ ] File taxes
+
+### Schedule — Important, Not Urgent
+- Learn Spanish
+
+### Delegate — Urgent, Not Important
+- Book flights
+
+### Delete — Neither
+- Reorganize the sock drawer
+
+## Done
+- [x] Fix the basement #urgent
+```
+
+Converting between the two never moves the Inbox or Done sections — only the middle changes.
 
 ---
 
