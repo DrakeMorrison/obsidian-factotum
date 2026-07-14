@@ -1,4 +1,4 @@
-# Drake's Factotum — Obsidian Plugin
+# Factotum — Obsidian Plugin
 
 A handy multi-tool for markdown lists. Rank by pairwise comparison, slot in new items via binary-search placement, or sort a flat list into an Eisenhower matrix. The order of the list **is** the ranking — no scores, no frontmatter clutter.
 
@@ -12,7 +12,7 @@ A handy multi-tool for markdown lists. Rank by pairwise comparison, slot in new 
 4. Create a new folder called `drake-factotum`
 5. Copy `main.js`, `manifest.json`, and `styles.css` into that folder
 6. In Obsidian: **Settings → Community plugins → Installed plugins → Refresh**
-7. Enable **Drake's Factotum**
+7. Enable **Factotum**
 
 ---
 
@@ -35,7 +35,7 @@ Make a markdown note with a simple list. Any bullet style works (`-`, `*`, `+`):
 
 Open the note, then use the command palette (`Cmd/Ctrl+P`):
 
-> **Drake's Factotum: Start ranking session**
+> **Factotum: Start ranking session**
 
 You'll be shown pairs of items. Click the one that matters more to you. The plugin runs an interactive merge sort, so every comparison is load-bearing — for *n* items expect roughly *n · log₂ n* comparisons. When done, click **Save to note** and the list is rewritten in ranked order.
 
@@ -43,17 +43,17 @@ If you can't decide between two items, hit **Skip** — the current relative ord
 
 ### Adding a new item
 
-> **Drake's Factotum: Add new item (binary-search placement)**
+> **Factotum: Add new item (binary-search placement)**
 
 Type your new item, then answer ~log₂(n) comparisons to slot it in the right place. For a 100-item list that's ~7 questions.
 
-By default this works on the note you're currently viewing. To always add to one designated TODO note no matter which note is open, set a **TODO note path** in **Settings → Drake's Factotum** (e.g. `TODO.md`). The command then targets that note from anywhere — and stays available even when no note is open. Leave the path blank to keep the original "current note" behavior.
+By default this works on the note you're currently viewing. To always add to one designated TODO note no matter which note is open, set a **TODO note path** in **Settings → Factotum** (e.g. `TODO.md`). The command then targets that note from anywhere — and stays available even when no note is open. Leave the path blank to keep the original "current note" behavior.
 
 ### Inbox: capture now, prioritize later
 
 Add an `## Inbox` heading anywhere in your TODO note (top or bottom — it stays where you put it) and toss unprioritized bullets under it as they occur to you. Inbox items are ignored by ranking sessions — they hold no rank until you triage them. When you're ready:
 
-> **Drake's Factotum: Triage inbox (prioritize and place each item)**
+> **Factotum: Triage inbox (prioritize and place each item)**
 
 Each inbox item is walked through the usual flow — in a matrix note you classify it (urgent? important?) and then binary-search-place it within its quadrant; in a flat note it's binary-search-placed straight into the ranked list. On save, every item lands in its spot and the Inbox is emptied (the heading stays, ready for the next capture).
 
@@ -72,7 +72,7 @@ Closing before making any decision leaves the note untouched. Partial saves go t
 
 Instead of answering every comparison yourself, you can hand the whole list to Claude:
 
-> **Drake's Factotum: Prioritize with Claude (whole list → Eisenhower matrix)**
+> **Factotum: Prioritize with Claude (whole list → Eisenhower matrix)**
 
 It sends every active item — quadrant contents, ranked list, and Inbox alike — to the Anthropic API, which classifies each into an Eisenhower quadrant and orders each quadrant by priority. You review the proposal in a modal before anything is written; **Save to note** applies it (a flat note becomes a matrix note), closing discards it. Items Claude fails to place are left in the Inbox rather than dropped. Requires the **Anthropic API key** in settings (shared with the periodic reviews); one API call per run.
 
@@ -104,13 +104,13 @@ After ranking, `Sketch the UI` and `Pick the stack` stay under `Build the side p
 
 Keeps a margin of context lines above and below the cursor while editing, so you're never writing against the very top or bottom edge of the window — the view scrolls a little ahead of you, the way Vim's `scrolloff` does.
 
-Set the number of lines in **Settings → Drake's Factotum → Editing → Scroll offset** (defaults to **10**). Set it to `0` to turn the behavior off. Desktop only — it's ignored on mobile, where the on-screen keyboard already manages the viewport.
+Set the number of lines in **Settings → Factotum → Editing → Scroll offset** (defaults to **10**). Set it to `0` to turn the behavior off. Desktop only — it's ignored on mobile, where the on-screen keyboard already manages the viewport.
 
 ### Nightly word count → Beeminder
 
 Optionally, the plugin can post your daily writing output to a [Beeminder](https://www.beeminder.com) goal every night at **11PM**.
 
-Enable it in **Settings → Drake's Factotum** and fill in:
+Enable it in **Settings → Factotum** and fill in:
 
 - **Auth token** — from `beeminder.com/api/v1/auth_token.json`
 - **Username** and **goal name** (the goal slug, e.g. `writing`)
@@ -126,7 +126,7 @@ Optionally, the plugin can generate a review note whenever a period closes — *
 - a prose **`## AI Summary`** of the period, and
 - **`## Review Questions`** — one reflective question per goal in your goals note, each as a heading with space to write your answer underneath.
 
-Enable them in **Settings → Drake's Factotum**. All reviews share:
+Enable them in **Settings → Factotum**. All reviews share:
 
 - **Anthropic API key** — from [console.anthropic.com](https://console.anthropic.com)
 - **Model** — defaults to `claude-opus-4-8` (any Anthropic model id works)

@@ -1148,18 +1148,18 @@ class ClaudePrioritizeModal extends obsidian.Modal {
         try {
             res = await callClaude(this.anthropic.apiKey, this.anthropic.model, system, user);
         } catch (e) {
-            console.error('Drake\'s Factotum — Claude request failed', e);
+            console.error('Factotum — Claude request failed', e);
             this.renderError('Claude could not be reached (network error).');
             return;
         }
         if (!res.ok) {
-            console.error('Drake\'s Factotum — Claude API error', res.status);
+            console.error('Factotum — Claude API error', res.status);
             this.renderError(`Claude API error (HTTP ${res.status}).`);
             return;
         }
         const sections = this.parseAssignment(res.text);
         if (!sections) {
-            console.error('Drake\'s Factotum — unparseable Claude response', res.text);
+            console.error('Factotum — unparseable Claude response', res.text);
             this.renderError('Claude returned a response that couldn\'t be parsed. Retry?');
             return;
         }
@@ -1498,14 +1498,14 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 const content = editor.getValue();
                 const parsed  = parseNote(content);
                 if (totalActiveItems(parsed) < 2) {
-                    new obsidian.Notice('Drake\'s Factotum: need at least 2 list items to compare.');
+                    new obsidian.Notice('Factotum: need at least 2 list items to compare.');
                     return;
                 }
                 new RankSessionModal(this.app, parsed, (result, partial) => {
                     applyResult(editor, content, result);
                     new obsidian.Notice(partial
-                        ? 'Drake\'s Factotum: session interrupted — progress saved; run again to finish.'
-                        : 'Drake\'s Factotum: rankings saved ✓');
+                        ? 'Factotum: session interrupted — progress saved; run again to finish.'
+                        : 'Factotum: rankings saved ✓');
                 }).open();
             }
         });
@@ -1521,14 +1521,14 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 if (path) {
                     const file = this.resolveTodoNote();
                     if (!file) {
-                        new obsidian.Notice(`Drake's Factotum: TODO note not found at "${path}". Check the path in settings.`);
+                        new obsidian.Notice(`Factotum: TODO note not found at "${path}". Check the path in settings.`);
                         return;
                     }
                     target = this.fileTarget(file);
                 } else {
                     const view = this.app.workspace.getActiveViewOfType(obsidian.MarkdownView);
                     if (!view) {
-                        new obsidian.Notice('Drake\'s Factotum: open a note, or set a TODO note path in settings.');
+                        new obsidian.Notice('Factotum: open a note, or set a TODO note path in settings.');
                         return;
                     }
                     target = { read: async () => view.editor.getValue(), write: async (c) => view.editor.setValue(c) };
@@ -1538,8 +1538,8 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 new AddItemModal(this.app, parsed, async (result, partial) => {
                     await target.write(computeResult(content, result));
                     new obsidian.Notice(partial
-                        ? 'Drake\'s Factotum: interrupted — item saved with best-effort placement ✓'
-                        : 'Drake\'s Factotum: item added ✓');
+                        ? 'Factotum: interrupted — item saved with best-effort placement ✓'
+                        : 'Factotum: item added ✓');
                 }).open();
             }
         });
@@ -1552,16 +1552,16 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 const parsed  = parseNote(content);
                 const inbox = parsed.mode === 'flat' ? parsed.inbox : parsed.sections.inbox;
                 if (inbox.length === 0) {
-                    new obsidian.Notice('Drake\'s Factotum: no items under an "Inbox" heading in this note.');
+                    new obsidian.Notice('Factotum: no items under an "Inbox" heading in this note.');
                     return;
                 }
                 new TriageInboxModal(this.app, parsed, (result, partial) => {
                     applyResult(editor, content, result);
                     if (partial) {
                         const left = (result.mode === 'flat' ? result.inbox : result.sections.inbox).length;
-                        new obsidian.Notice(`Drake's Factotum: triage interrupted — placed items saved, ${left} still in the Inbox.`);
+                        new obsidian.Notice(`Factotum: triage interrupted — placed items saved, ${left} still in the Inbox.`);
                     } else {
-                        new obsidian.Notice('Drake\'s Factotum: inbox triaged ✓');
+                        new obsidian.Notice('Factotum: inbox triaged ✓');
                     }
                 }).open();
             }
@@ -1572,7 +1572,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             name: 'Prioritize with Claude (whole list → Eisenhower matrix)',
             editorCallback: (editor) => {
                 if (!this.settings.anthropic.apiKey) {
-                    new obsidian.Notice('Drake\'s Factotum: set an Anthropic API key in settings first.');
+                    new obsidian.Notice('Factotum: set an Anthropic API key in settings first.');
                     return;
                 }
                 const content = editor.getValue();
@@ -1580,12 +1580,12 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 const count = totalActiveItems(parsed) +
                     (parsed.mode === 'flat' ? parsed.inbox.length : parsed.sections.inbox.length);
                 if (count === 0) {
-                    new obsidian.Notice('Drake\'s Factotum: no items to prioritize.');
+                    new obsidian.Notice('Factotum: no items to prioritize.');
                     return;
                 }
                 new ClaudePrioritizeModal(this.app, parsed, this.settings.anthropic, (result) => {
                     applyResult(editor, content, result);
-                    new obsidian.Notice('Drake\'s Factotum: Claude\'s prioritization saved ✓');
+                    new obsidian.Notice('Factotum: Claude\'s prioritization saved ✓');
                 }).open();
             }
         });
@@ -1597,29 +1597,29 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 const content = editor.getValue();
                 const parsed  = parseNote(content);
                 if (parsed.mode === 'matrix') {
-                    new obsidian.Notice('Drake\'s Factotum: this note is already in matrix mode.');
+                    new obsidian.Notice('Factotum: this note is already in matrix mode.');
                     return;
                 }
                 if (parsed.items.length === 0) {
-                    new obsidian.Notice('Drake\'s Factotum: no items to classify.');
+                    new obsidian.Notice('Factotum: no items to classify.');
                     return;
                 }
                 new ConvertModal(this.app, parsed, (result, partial) => {
                     applyResult(editor, content, result);
                     new obsidian.Notice(partial
-                        ? 'Drake\'s Factotum: conversion interrupted — classified items placed; the rest are in the Inbox.'
-                        : 'Drake\'s Factotum: converted to Eisenhower matrix ✓');
+                        ? 'Factotum: conversion interrupted — classified items placed; the rest are in the Inbox.'
+                        : 'Factotum: converted to Eisenhower matrix ✓');
                 }).open();
             }
         });
 
-        console.log('Drake\'s Factotum loaded');
+        console.log('Factotum loaded');
     }
 
     onunload() {
         this.clearBeeminderTimer();
         this.clearAllReviewTimers();
-        console.log('Drake\'s Factotum unloaded');
+        console.log('Factotum unloaded');
     }
 
     // nvim-style scrolloff: keep `scrollOff` lines of context above and below the
@@ -1775,12 +1775,12 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const s = this.settings.beeminder;
         if (!s.enabled) return;
         if (!s.authToken || !s.username || !s.goalName) {
-            if (notify) new obsidian.Notice('Drake\'s Factotum: Beeminder not configured (token, user, and goal required).');
+            if (notify) new obsidian.Notice('Factotum: Beeminder not configured (token, user, and goal required).');
             return;
         }
         const config = getDailyNoteConfig(this.app);
         if (!config) {
-            if (notify) new obsidian.Notice('Drake\'s Factotum: could not find a Daily Notes / Periodic Notes config.');
+            if (notify) new obsidian.Notice('Factotum: could not find a Daily Notes / Periodic Notes config.');
             return;
         }
         const day = targetMoment || obsidian.moment();
@@ -1795,7 +1795,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const notePath = dailyNotePath(config, day);
         const noteFile = this.app.vault.getAbstractFileByPath(notePath);
         if (!(noteFile instanceof obsidian.TFile)) {
-            if (notify) new obsidian.Notice(`Drake's Factotum: no daily note for ${day.format('YYYY-MM-DD')} yet — nothing sent.`);
+            if (notify) new obsidian.Notice(`Factotum: no daily note for ${day.format('YYYY-MM-DD')} yet — nothing sent.`);
             return;
         }
         const noteWords = countWords(await this.app.vault.cachedRead(noteFile));
@@ -1810,16 +1810,16 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             if (res.status >= 200 && res.status < 300) {
                 s.lastSubmittedDaystamp = daystamp;
                 await this.saveSettings();
-                if (notify) new obsidian.Notice(`Drake's Factotum: sent ${value} words to Beeminder ✓`);
+                if (notify) new obsidian.Notice(`Factotum: sent ${value} words to Beeminder ✓`);
             } else {
                 // Background runs stay silent (they retry on the next open/timer);
                 // the console keeps the record. Manual "Send now" surfaces it.
-                if (notify) new obsidian.Notice(`Drake's Factotum: Beeminder rejected the submission (HTTP ${res.status}).`);
-                console.error('Drake\'s Factotum — Beeminder error', res.status, res.text);
+                if (notify) new obsidian.Notice(`Factotum: Beeminder rejected the submission (HTTP ${res.status}).`);
+                console.error('Factotum — Beeminder error', res.status, res.text);
             }
         } catch (e) {
-            if (notify) new obsidian.Notice('Drake\'s Factotum: Beeminder submission failed (network error).');
-            console.error('Drake\'s Factotum — Beeminder request failed', e);
+            if (notify) new obsidian.Notice('Factotum: Beeminder submission failed (network error).');
+            console.error('Factotum — Beeminder request failed', e);
         }
     }
 
@@ -1909,12 +1909,12 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const s = this.settings[k.settingsKey];
         if (!s.enabled) return;
         if (!this.settings.anthropic.apiKey) {
-            if (notify) new obsidian.Notice(`Drake's Factotum: the ${k.noun}ly review needs an Anthropic API key.`);
+            if (notify) new obsidian.Notice(`Factotum: the ${k.noun}ly review needs an Anthropic API key.`);
             return;
         }
         const config = getDailyNoteConfig(this.app);
         if (!config) {
-            if (notify) new obsidian.Notice('Drake\'s Factotum: could not find a Daily Notes / Periodic Notes config.');
+            if (notify) new obsidian.Notice('Factotum: could not find a Daily Notes / Periodic Notes config.');
             return;
         }
 
@@ -1945,7 +1945,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             // yet (vault still indexing, or sync lag from another device).
             // Leaving the stamp unset lets a later open re-scan and review once
             // notes arrive.
-            if (notify) new obsidian.Notice(`Drake's Factotum: no daily notes found for ${stamp}.`);
+            if (notify) new obsidian.Notice(`Factotum: no daily notes found for ${stamp}.`);
             return;
         }
 
@@ -1957,25 +1957,25 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const range = `${dates[0].format('YYYY-MM-DD')} to ${dates[dates.length - 1].format('YYYY-MM-DD')}`;
         const userContent = `Daily notes for the ${k.noun} of ${stamp} (${range}):\n\n${sections.join('\n\n')}${goalsBlock}`;
 
-        new obsidian.Notice(`Drake's Factotum: generating ${k.noun}ly review for ${stamp}…`);
+        new obsidian.Notice(`Factotum: generating ${k.noun}ly review for ${stamp}…`);
         let result;
         try {
             result = await callClaude(this.settings.anthropic.apiKey, this.settings.anthropic.model, reviewSystem(k.noun, !!goalsText), userContent);
         } catch (e) {
-            new obsidian.Notice(`Drake's Factotum: ${k.noun}ly review request failed (network error).`);
-            console.error('Drake\'s Factotum — Claude request failed', e);
+            new obsidian.Notice(`Factotum: ${k.noun}ly review request failed (network error).`);
+            console.error('Factotum — Claude request failed', e);
             return;
         }
         if (!result.ok) {
-            new obsidian.Notice(`Drake's Factotum: Claude API error (HTTP ${result.status}).`);
-            console.error('Drake\'s Factotum — Claude API error', result.status);
+            new obsidian.Notice(`Factotum: Claude API error (HTTP ${result.status}).`);
+            console.error('Factotum — Claude API error', result.status);
             return;
         }
         const reviewBody = result.text.trim();
         if (!reviewBody) {
             // Empty/non-text response — don't write a hollow note or stamp the period.
-            new obsidian.Notice('Drake\'s Factotum: Claude returned an empty response; no review written.');
-            console.error('Drake\'s Factotum — empty Claude response');
+            new obsidian.Notice('Factotum: Claude returned an empty response; no review written.');
+            console.error('Factotum — empty Claude response');
             return;
         }
 
@@ -1987,14 +1987,14 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             const file = await this.writeReviewNote(s.folder, stamp, note);
             s[k.stampField] = stamp;
             await this.saveSettings();
-            new obsidian.Notice(`Drake's Factotum: ${k.noun}ly review for ${stamp} saved ✓`);
+            new obsidian.Notice(`Factotum: ${k.noun}ly review for ${stamp} saved ✓`);
             if (notify && file) {
                 this.app.workspace.getLeaf(true).openFile(file)
-                    .catch(e => console.error('Drake\'s Factotum — could not open review note', e));
+                    .catch(e => console.error('Factotum — could not open review note', e));
             }
         } catch (e) {
-            new obsidian.Notice(`Drake's Factotum: could not write the ${k.noun}ly review note.`);
-            console.error(`Drake's Factotum — ${k.noun}ly review write failed`, e);
+            new obsidian.Notice(`Factotum: could not write the ${k.noun}ly review note.`);
+            console.error(`Factotum — ${k.noun}ly review write failed`, e);
         }
     }
 

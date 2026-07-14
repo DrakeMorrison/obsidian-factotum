@@ -1,6 +1,6 @@
 {
   "id": "drake-factotum",
-  "name": "Drake's Factotum",
+  "name": "Factotum",
   "version": "1.0.0",
   "minAppVersion": "0.15.0",
   "description": "A handy multi-tool for markdown lists: rank by pairwise comparison, insert items via binary-search placement, or sort into an Eisenhower matrix.",
