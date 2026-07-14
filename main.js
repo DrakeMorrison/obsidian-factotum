@@ -1663,7 +1663,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
 
         this.addCommand({
             id: 'factotum-add-item',
-            name: 'Add new item (binary-search placement)',
+            name: 'Add new item to the note',
             // Not an editorCallback: a configured TODO note is targeted no
             // matter which note is active, so this command is always available.
             callback: async () => {

@@ -45,7 +45,7 @@ On a **matrix note**, the quadrant *is* the rank — there are no within-quadran
 
 ### Adding a new item
 
-> **Factotum: Add new item (binary-search placement)**
+> **Factotum: Add new item to the note**
 
 Type your new item, then answer ~log₂(n) comparisons to slot it in the right place. For a 100-item list that's ~7 questions. In a matrix note it's just the two classification questions (urgent? important?) — the item lands at the end of its quadrant, no comparisons.
 
