@@ -37,15 +37,17 @@ Open the note, then use the command palette (`Cmd/Ctrl+P`):
 
 > **Factotum: Start ranking session**
 
-You'll be shown pairs of items. Click the one that matters more to you. The plugin runs an interactive merge sort, so every comparison is load-bearing — for *n* items expect roughly *n · log₂ n* comparisons. When done, click **Save to note** and the list is rewritten in ranked order.
+On a **flat note**, you'll be shown pairs of items. Click the one that matters more to you. The plugin runs an interactive merge sort, so every comparison is load-bearing — for *n* items expect roughly *n · log₂ n* comparisons. When done, click **Save to note** and the list is rewritten in ranked order.
 
 If you can't decide between two items, hit **Skip** — the current relative order is preserved for that pair.
+
+On a **matrix note**, the quadrant *is* the rank — there are no within-quadrant comparisons. The session instead walks every active item and asks two quick questions (urgent? important?), moving each item to the quadrant its answers pick. That's a flat 2 decisions per item instead of *n · log₂ n*, and it doubles as a periodic re-triage when priorities shift. Order within a quadrant stays as-is; rearrange bullets by hand if you care.
 
 ### Adding a new item
 
 > **Factotum: Add new item (binary-search placement)**
 
-Type your new item, then answer ~log₂(n) comparisons to slot it in the right place. For a 100-item list that's ~7 questions.
+Type your new item, then answer ~log₂(n) comparisons to slot it in the right place. For a 100-item list that's ~7 questions. In a matrix note it's just the two classification questions (urgent? important?) — the item lands at the end of its quadrant, no comparisons.
 
 By default this works on the note you're currently viewing. To always add to one designated TODO note no matter which note is open, set a **TODO note path** in **Settings → Factotum** (e.g. `TODO.md`). The command then targets that note from anywhere — and stays available even when no note is open. Leave the path blank to keep the original "current note" behavior.
 
@@ -55,15 +57,15 @@ Add an `## Inbox` heading to your TODO note and toss unprioritized bullets under
 
 > **Factotum: Triage inbox (prioritize and place each item)**
 
-Each inbox item is walked through the usual flow — in a matrix note you classify it (urgent? important?) and then binary-search-place it within its quadrant; in a flat note it's binary-search-placed straight into the ranked list. On save, every item lands in its spot and the Inbox is emptied (the heading stays, ready for the next capture).
+Each inbox item is walked through the usual flow — in a matrix note you classify it (urgent? important?) and it lands at the end of that quadrant; in a flat note it's binary-search-placed into the ranked list. On save, every item lands in its spot and the Inbox is emptied (the heading stays, ready for the next capture).
 
 ### Stopping partway — progress is saved
 
 Every interactive session can be closed at any point (Esc, the ✕, or clicking outside) without losing the decisions you've already made:
 
-- **Ranking session** — comparisons made so far are kept: fully merged groups (and fully sorted quadrants) stay in their decided order, and everything not yet compared keeps its current relative order. Run the session again later to finish the job.
+- **Ranking session** — decisions made so far are kept: in a flat note, fully merged groups stay in their decided order; in a matrix note, items already re-classified keep their new quadrant. Everything not yet reached keeps its current place. Run the session again later to finish the job.
 - **Triage inbox** — items you've already placed are saved into position; the current item and anything you didn't reach stay in the Inbox for next time.
-- **Add new item** — mid-placement, the item is saved at the midpoint of the range your answers have narrowed it to; in a matrix note, closing before classifying drops it into the Inbox instead.
+- **Add new item** — in a flat note, closing mid-placement saves the item at the midpoint of the range your answers have narrowed it to; in a matrix note, closing before classifying drops it into the Inbox instead.
 - **Convert to matrix** — items you've classified land in their quadrants; the rest go to the Inbox.
 
 Closing before making any decision leaves the note untouched. Partial saves go through the editor, so `Ctrl/Cmd+Z` undoes one if you actually meant to cancel.

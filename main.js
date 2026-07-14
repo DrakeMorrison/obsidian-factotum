@@ -376,24 +376,21 @@ class RankSessionModal extends obsidian.Modal {
         this.payload = payload;
         this.onComplete = onComplete;
         this.comparisonCount = 0;
-        this.currentQuadrantLabel = null;
         // Partial-progress state, so closing mid-session saves what's decided.
         this.finished = false;      // a result was already handed to onComplete
         this.finalResult = null;    // full result shown on the results screen
-        this.sortState = null;      // live view into the in-progress merge sort
-        this.matrixOut = null;      // matrix mode: quadrants finished so far
-        this.currentQuadrantKey = null;
+        this.sortState = null;      // flat mode: live view into the merge sort
+        this.matrixOut = null;      // matrix mode: quadrants re-filled so far
+        this.entries = [];          // matrix mode: every active item with its current quadrant
+        this.entryIdx = 0;
 
         if (payload.mode === 'flat') {
             const n = Math.max(payload.items.length, 2);
             this.estimatedTotal = n * Math.ceil(Math.log2(n));
         } else {
             let total = 0;
-            for (const q of QUADRANTS) {
-                const n = payload.sections[q.key].length;
-                if (n >= 2) total += n * Math.ceil(Math.log2(n));
-            }
-            this.estimatedTotal = Math.max(total, 1);
+            for (const q of QUADRANTS) total += payload.sections[q.key].length;
+            this.estimatedTotal = Math.max(total * 2, 1);
         }
     }
 
@@ -402,9 +399,10 @@ class RankSessionModal extends obsidian.Modal {
         this.run();
     }
 
-    // Closing mid-session keeps every decision made so far: completed merges
-    // (and completed quadrants) stay ordered, and whatever wasn't compared yet
-    // keeps its current relative order. Zero comparisons → nothing to save.
+    // Closing mid-session keeps every decision made so far: in a flat note
+    // completed merges stay ordered; in a matrix note items already
+    // re-classified keep their new quadrant. Whatever wasn't reached keeps
+    // its current place. Zero answers → nothing to save.
     onClose() {
         this.contentEl.empty();
         if (this.finished) return;
@@ -426,18 +424,26 @@ class RankSessionModal extends obsidian.Modal {
             return;
         }
 
+        // Matrix mode: no within-quadrant comparisons — the quadrant is the
+        // rank. Walk every active item and re-classify it (urgent?
+        // important?), keeping encounter order inside each quadrant.
         const out = emptySections();
         out.done = this.payload.sections.done;
         out.inbox = this.payload.sections.inbox;
         this.matrixOut = out;
         for (const q of QUADRANTS) {
-            this.currentQuadrantLabel = q.heading;
-            this.currentQuadrantKey = q.key;
-            const items = this.payload.sections[q.key];
-            if (items.length < 2) { out[q.key] = items; continue; }
-            out[q.key] = await this.mergeSort(items);
+            for (const item of this.payload.sections[q.key]) this.entries.push({ item, from: q });
         }
-        this.currentQuadrantKey = null;
+        for (this.entryIdx = 0; this.entryIdx < this.entries.length; this.entryIdx++) {
+            const { item } = this.entries[this.entryIdx];
+            const urgent = await this.askClassify(item, 'Is this urgent?',
+                'Urgent things have a hard deadline or consequence if delayed.',
+                'Yes, urgent', 'No, not urgent');
+            const important = await this.askClassify(item, 'Is this important?',
+                'Important things move you toward your goals or values.',
+                'Yes, important', 'No, not important');
+            out[findQuadrant(urgent, important).key].push(item);
+        }
         this.renderResults({ mode: 'matrix', sections: out });
     }
 
@@ -502,16 +508,11 @@ class RankSessionModal extends obsidian.Modal {
         const sections = emptySections();
         sections.done = this.payload.sections.done;
         sections.inbox = this.payload.sections.inbox;
-        let reached = false;
-        for (const q of QUADRANTS) {
-            if (q.key === this.currentQuadrantKey) {
-                reached = true;
-                sections[q.key] = this.bestEffortSorted() || this.payload.sections[q.key];
-            } else {
-                // Quadrants before the current one are fully sorted in
-                // matrixOut; the ones after haven't been touched.
-                sections[q.key] = reached ? this.payload.sections[q.key] : this.matrixOut[q.key];
-            }
+        for (const q of QUADRANTS) sections[q.key] = [...this.matrixOut[q.key]];
+        // Items not yet fully re-classified (including the one on screen)
+        // keep their current quadrant.
+        for (let i = this.entryIdx; i < this.entries.length; i++) {
+            sections[this.entries[i].from.key].push(this.entries[i].item);
         }
         return { mode: 'matrix', sections };
     }
@@ -523,18 +524,37 @@ class RankSessionModal extends obsidian.Modal {
         });
     }
 
-    renderComparison(a, b, resolve) {
+    askClassify(item, question, explainer, yesLabel, noLabel) {
+        return new Promise(resolve => {
+            this.comparisonCount++;
+            this.renderClassify(item, question, explainer, yesLabel, noLabel, resolve);
+        });
+    }
+
+    renderClassify(item, question, explainer, yesLabel, noLabel, resolve) {
         const { contentEl } = this;
         contentEl.empty();
 
-        if (this.currentQuadrantLabel) {
-            contentEl.createDiv({
-                cls: 'ordinal-quadrant-label',
-                text: this.currentQuadrantLabel,
-            });
-        }
-        contentEl.createEl('h2', { text: 'Which matters more to you?' });
+        contentEl.createDiv({
+            cls: 'ordinal-quadrant-label',
+            text: `Item ${this.entryIdx + 1} of ${this.entries.length}`,
+        });
+        contentEl.createEl('h2', { text: item.text });
+        contentEl.createEl('p', { text: `${question} ${explainer}`, cls: 'ordinal-hint' });
 
+        this.renderProgress(contentEl);
+
+        const grid = contentEl.createDiv({ cls: 'ordinal-grid' });
+        const yes = grid.createEl('button', { text: yesLabel, cls: 'ordinal-choice' });
+        grid.createDiv({ cls: 'ordinal-vs', text: '/' });
+        const no  = grid.createEl('button', { text: noLabel, cls: 'ordinal-choice' });
+        yes.addEventListener('click', () => resolve(true));
+        no .addEventListener('click', () => resolve(false));
+
+        closeHint(contentEl, 'Close anytime — items classified so far are saved.');
+    }
+
+    renderProgress(contentEl) {
         const prog = contentEl.createDiv({ cls: 'ordinal-progress' });
         const fill = prog.createDiv({ cls: 'ordinal-progress-fill' });
         const pct = Math.min(100, (this.comparisonCount / this.estimatedTotal) * 100);
@@ -543,6 +563,15 @@ class RankSessionModal extends obsidian.Modal {
             cls: 'ordinal-progress-label',
             text: `${this.comparisonCount} / ~${this.estimatedTotal}`
         });
+    }
+
+    renderComparison(a, b, resolve) {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: 'Which matters more to you?' });
+
+        this.renderProgress(contentEl);
 
         const grid = contentEl.createDiv({ cls: 'ordinal-grid' });
         const btnA = grid.createEl('button', { text: a.text, cls: 'ordinal-choice' });
@@ -565,7 +594,9 @@ class RankSessionModal extends obsidian.Modal {
         this.finalResult = result;
         const { contentEl } = this;
         contentEl.empty();
-        contentEl.createEl('h2', { text: '🏆 Ranking Complete' });
+        contentEl.createEl('h2', {
+            text: result.mode === 'flat' ? '🏆 Ranking Complete' : '🏆 Classification Complete'
+        });
 
         if (result.mode === 'flat') {
             const ol = contentEl.createEl('ol', { cls: 'ordinal-results-list' });
@@ -684,7 +715,7 @@ class AddItemModal extends obsidian.Modal {
             });
         } else {
             contentEl.createEl('p', {
-                text: 'After naming, you\'ll classify it into an Eisenhower quadrant, then binary-search-place it within that quadrant.',
+                text: 'After naming, you\'ll classify it into an Eisenhower quadrant (urgent? important?) — it lands at the end of that quadrant.',
                 cls: 'ordinal-hint'
             });
         }
@@ -751,14 +782,12 @@ class AddItemModal extends obsidian.Modal {
     }
 
     startMatrix(important) {
+        // No within-quadrant comparisons in a matrix — the quadrant is the
+        // rank, so the item simply lands at the end of its quadrant.
         const q = findQuadrant(this.urgent, important);
         this.targetQuadrant = q;
         this.sorted = [...this.payload.sections[q.key]];
-        this.searchStarted = true;
-        this.lo = 0;
-        this.hi = this.sorted.length - 1;
-        if (this.sorted.length === 0) this.finish(0);
-        else this.renderCompare();
+        this.finish(this.sorted.length);
     }
 
     renderCompare() {
@@ -810,7 +839,7 @@ class AddItemModal extends obsidian.Modal {
         contentEl.empty();
         contentEl.createEl('h2', { text: '✓ Item Placed!' });
         const summary = placedQuadrant
-            ? `"${this.newItem.text}" is ranked #${rank} of ${sortedWithNew.length} in ${placedQuadrant.heading}`
+            ? `"${this.newItem.text}" was added to ${placedQuadrant.heading}`
             : `"${this.newItem.text}" is ranked #${rank} out of ${sortedWithNew.length}`;
         contentEl.createEl('p', { text: summary, cls: 'ordinal-hint' });
 
@@ -864,6 +893,18 @@ class TriageInboxModal extends obsidian.Modal {
         this.list = null;
         this.lo = 0;
         this.hi = 0;
+        // Progress: a matrix item takes 2 classification answers; a flat item
+        // takes ~log2 comparisons against a list that grows as items land.
+        this.decisionCount = 0;
+        if (payload.mode === 'flat') {
+            let total = 0;
+            for (let k = 0; k < this.queue.length; k++) {
+                total += Math.ceil(Math.log2(this.items.length + k + 1));
+            }
+            this.estimatedTotal = Math.max(total, 1);
+        } else {
+            this.estimatedTotal = Math.max(this.queue.length * 2, 1);
+        }
     }
 
     onOpen() {
@@ -889,6 +930,17 @@ class TriageInboxModal extends obsidian.Modal {
     current() { return this.queue[this.idx]; }
     progressLabel() { return `Inbox item ${this.idx + 1} of ${this.queue.length}`; }
 
+    renderProgress(contentEl) {
+        const prog = contentEl.createDiv({ cls: 'ordinal-progress' });
+        const fill = prog.createDiv({ cls: 'ordinal-progress-fill' });
+        const pct = Math.min(100, (this.decisionCount / this.estimatedTotal) * 100);
+        fill.style.width = `${pct}%`;
+        prog.createDiv({
+            cls: 'ordinal-progress-label',
+            text: `${this.decisionCount} / ~${this.estimatedTotal}`
+        });
+    }
+
     nextItem() {
         if (this.idx >= this.queue.length) { this.renderResults(); return; }
         if (this.payload.mode === 'flat') {
@@ -903,9 +955,11 @@ class TriageInboxModal extends obsidian.Modal {
         const item = this.current();
         const { contentEl } = this;
         contentEl.empty();
+        this.decisionCount++;
         contentEl.createDiv({ cls: 'ordinal-quadrant-label', text: this.progressLabel() });
         contentEl.createEl('h2', { text: item.text });
         contentEl.createEl('p', { text: 'Is this urgent?', cls: 'ordinal-hint' });
+        this.renderProgress(contentEl);
 
         const grid = contentEl.createDiv({ cls: 'ordinal-grid' });
         const yes = grid.createEl('button', { text: 'Yes, urgent', cls: 'ordinal-choice' });
@@ -921,9 +975,11 @@ class TriageInboxModal extends obsidian.Modal {
         const item = this.current();
         const { contentEl } = this;
         contentEl.empty();
+        this.decisionCount++;
         contentEl.createDiv({ cls: 'ordinal-quadrant-label', text: this.progressLabel() });
         contentEl.createEl('h2', { text: item.text });
         contentEl.createEl('p', { text: 'Is this important?', cls: 'ordinal-hint' });
+        this.renderProgress(contentEl);
 
         const grid = contentEl.createDiv({ cls: 'ordinal-grid' });
         const yes = grid.createEl('button', { text: 'Yes, important', cls: 'ordinal-choice' });
@@ -936,8 +992,11 @@ class TriageInboxModal extends obsidian.Modal {
     }
 
     classify(important) {
+        // No within-quadrant comparisons in a matrix — the item lands at the
+        // end of its quadrant.
         this.targetQuadrant = findQuadrant(this.urgent, important);
-        this.startPlacement(this.sections[this.targetQuadrant.key]);
+        this.list = this.sections[this.targetQuadrant.key];
+        this.place(this.list.length);
     }
 
     // Binary-search the current item into `list` (mutated in place), so later
@@ -958,12 +1017,14 @@ class TriageInboxModal extends obsidian.Modal {
 
         const { contentEl } = this;
         contentEl.empty();
+        this.decisionCount++;
 
         contentEl.createDiv({ cls: 'ordinal-quadrant-label', text: this.progressLabel() });
         if (this.targetQuadrant) {
             contentEl.createDiv({ cls: 'ordinal-quadrant-label', text: this.targetQuadrant.heading });
         }
         contentEl.createEl('h2', { text: 'Which matters more?' });
+        this.renderProgress(contentEl);
 
         const grid = contentEl.createDiv({ cls: 'ordinal-grid' });
         const btnNew = grid.createEl('button', { text: item.text, cls: 'ordinal-choice ordinal-new' });
@@ -1121,7 +1182,7 @@ class ConvertModal extends obsidian.Modal {
         contentEl.empty();
         contentEl.createEl('h2', { text: '✓ Classified!' });
         contentEl.createEl('p', {
-            text: 'Note will be rewritten with the four Eisenhower headings. Order within each quadrant is unchanged — run a ranking session next to sort each bucket.',
+            text: 'Note will be rewritten with the four Eisenhower headings. Order within each quadrant is unchanged.',
             cls: 'ordinal-hint'
         });
 
@@ -1582,8 +1643,13 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             editorCallback: (editor) => {
                 const content = editor.getValue();
                 const parsed  = parseNote(content);
-                if (totalActiveItems(parsed) < 2) {
-                    new obsidian.Notice('Factotum: need at least 2 list items to compare.');
+                // A flat session compares pairs (needs 2); a matrix session
+                // re-classifies items one at a time (needs 1).
+                const minItems = parsed.mode === 'flat' ? 2 : 1;
+                if (totalActiveItems(parsed) < minItems) {
+                    new obsidian.Notice(parsed.mode === 'flat'
+                        ? 'Factotum: need at least 2 list items to compare.'
+                        : 'Factotum: no items to classify.');
                     return;
                 }
                 new RankSessionModal(this.app, parsed, (result, partial) => {
