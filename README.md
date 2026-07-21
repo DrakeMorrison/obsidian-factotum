@@ -129,9 +129,9 @@ Each night it counts the words in today's daily note, **subtracts the word count
 
 If Obsidian wasn't open at 11PM, it catches up the next time you launch (provided it's still past 11PM and that day hasn't been sent yet). Re-sends for the same day update the datapoint rather than duplicating it. Use **Send now** in settings to test your setup.
 
-### Periodic review notes (weekly, monthly, quarterly, yearly)
+### Periodic review notes (weekly, monthly, quarterly, yearly, decade, century)
 
-Optionally, the plugin can generate a review note whenever a period closes — **weekly** (just after Sunday midnight), **monthly** (just after midnight on the 1st), **quarterly** (Jan/Apr/Jul/Oct 1), and **yearly** (January 1). Each is enabled independently, and each reads the just-finished period's **daily notes** directly — the longer reviews don't summarize the shorter ones — and uses the [Anthropic Claude API](https://www.anthropic.com) to write:
+Optionally, the plugin can generate a review note whenever a period closes — **weekly** (just after Sunday midnight), **monthly** (just after midnight on the 1st), **quarterly** (Jan/Apr/Jul/Oct 1), **yearly** (January 1), **decade** (January 1 of years ending in 0), and **century** (January 1 of years ending in 00). Each is enabled independently, reads the just-finished period's **daily notes**, and uses the [Anthropic Claude API](https://www.anthropic.com) to write:
 
 - a prose **`## AI Summary`** of the period, and
 - **`## Review Questions`** — one reflective question per goal in your goals note, each as a heading with space to write your answer underneath.
@@ -143,13 +143,15 @@ Enable them in **Settings → Factotum**. All reviews share:
 
 and each has its own:
 
-- **Review folder** — defaults to `Weekly Reviews`, `Monthly Reviews`, `Quarterly Reviews`, `Yearly Reviews`
-- **Header embed** (optional) — inserted at the top of every review, above the summary. Defaults to `![[goals#goals]]` (an embed of your goals note); blank to omit.
+- **Review folder** — defaults to `Weekly Reviews`, `Monthly Reviews`, `Quarterly Reviews`, `Yearly Reviews`, `Decade Reviews`, `Century Reviews`
+- **Header embed** (optional) — a wiki link like `![[goals#goals]]` (the default) whose linked section's text is **copied** into the top of every review, above the summary. Copying, rather than embedding, preserves what your goals were at the time the review was written even as the goals note changes later; blank to omit.
 - **Goals source** (optional) — a wiki link like `![[goals#goals]]` whose linked section is read so the review ends with one question per goal; blank to skip the questions.
 
-Notes are named by period — `2026-W23.md`, `2026-06.md`, `2026-Q2.md`, `2026.md` — and created automatically in their folder. Daily notes are located from your **Daily Notes** or **Periodic Notes** settings. If Obsidian was closed at the scheduled time (including on mobile, where background timers don't fire), it catches up on the next launch for the most recent period that wasn't yet generated. An existing review note is never overwritten — a manual re-run writes a numbered sibling instead. Use **Generate now** in settings to test your setup (mid-period it reviews the days so far).
+Notes are named by period — `2026-W23.md`, `2026-06.md`, `2026-Q2.md`, `2026.md`, `2020s.md`, `21st Century.md` — and created automatically in their folder. Daily notes are located from your **Daily Notes** or **Periodic Notes** settings. If Obsidian was closed at the scheduled time (including on mobile, where background timers don't fire), it catches up on the next launch for the most recent period that wasn't yet generated. An existing review note is never overwritten — a manual re-run writes a numbered sibling instead. Use **Generate now** in settings to test your setup (mid-period it reviews the days so far).
 
-> Each run makes one Claude API call (typically a few cents; the yearly review sends a full year of daily notes, so it costs more — very large vaults may approach the model's context limit). The API key is stored locally in the plugin's `data.json`.
+The longer spans handle the model's context window automatically: when a period's daily notes would exceed the input budget (~150k tokens, estimated at 4 characters per token), the **yearly**, **decade**, and **century** reviews instead read the plugin's own previously generated review notes at the finest granularity that fits — weekly reviews first, then monthly, quarterly, yearly (and, for the century, decade reviews) — from those reviews' configured folders. Review notes missing for parts of the span are simply skipped, and the note's frontmatter records which source was used (`source: weekly reviews`). Weekly, monthly, and quarterly reviews always read daily notes directly.
+
+> Each run makes one Claude API call (typically a few cents; the longer reviews send more input, so they cost more — up to the ~150k-token input budget). The API key is stored locally in the plugin's `data.json`.
 
 ---
 

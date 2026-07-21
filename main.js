@@ -1403,36 +1403,50 @@ const DEFAULT_SETTINGS = {
         lastSubmittedDaystamp: '', // YYYYMMDD of the last successful send
     },
     anthropic: {
-        apiKey: '',                // shared by the weekly and monthly reviews
+        apiKey: '',                // shared by all periodic reviews and prioritization
         model: 'claude-opus-4-8',
     },
     weeklyReview: {
         enabled: false,
         folder: 'Weekly Reviews',
-        headerEmbed: '![[goals#goals]]', // inserted above the summary; blank to omit
+        headerEmbed: '![[goals#goals]]', // its section text is copied in above the summary; blank to omit
         goalsSource: '![[goals#goals]]', // section read so Claude can pose a review question per goal; blank to omit
         lastReviewWeekstamp: '',   // GGGG-[W]WW of the last created review
     },
     monthlyReview: {
         enabled: false,
         folder: 'Monthly Reviews',
-        headerEmbed: '![[goals#goals]]', // inserted above the summary; blank to omit
+        headerEmbed: '![[goals#goals]]', // its section text is copied in above the summary; blank to omit
         goalsSource: '![[goals#goals]]', // section read so Claude can pose a review question per goal; blank to omit
         lastReviewMonthstamp: '',  // YYYY-MM of the last created review
     },
     quarterlyReview: {
         enabled: false,
         folder: 'Quarterly Reviews',
-        headerEmbed: '![[goals#goals]]', // inserted above the summary; blank to omit
+        headerEmbed: '![[goals#goals]]', // its section text is copied in above the summary; blank to omit
         goalsSource: '![[goals#goals]]', // section read so Claude can pose a review question per goal; blank to omit
         lastReviewQuarterstamp: '', // YYYY-[Q]Q of the last created review
     },
     yearlyReview: {
         enabled: false,
         folder: 'Yearly Reviews',
-        headerEmbed: '![[goals#goals]]', // inserted above the summary; blank to omit
+        headerEmbed: '![[goals#goals]]', // its section text is copied in above the summary; blank to omit
         goalsSource: '![[goals#goals]]', // section read so Claude can pose a review question per goal; blank to omit
         lastReviewYearstamp: '',   // YYYY of the last created review
+    },
+    decadeReview: {
+        enabled: false,
+        folder: 'Decade Reviews',
+        headerEmbed: '![[goals#goals]]', // its section text is copied in above the summary; blank to omit
+        goalsSource: '![[goals#goals]]', // section read so Claude can pose a review question per goal; blank to omit
+        lastReviewDecadestamp: '', // e.g. "2020s" of the last created review
+    },
+    centuryReview: {
+        enabled: false,
+        folder: 'Century Reviews',
+        headerEmbed: '![[goals#goals]]', // its section text is copied in above the summary; blank to omit
+        goalsSource: '![[goals#goals]]', // section read so Claude can pose a review question per goal; blank to omit
+        lastReviewCenturystamp: '', // e.g. "21st Century" of the last created review
     },
 };
 
@@ -1552,19 +1566,46 @@ async function readEmbeddedSection(app, embed) {
     return heading ? extractSection(content, heading) : stripFrontmatter(content).trim();
 }
 
-// Every date of the period (a moment unit: 'isoWeek', 'month', 'quarter',
-// 'year') containing `lastDayMoment`, from its first day through
-// `lastDayMoment` itself — the period's last day for scheduled runs; a
-// mid-period manual run just gets the days so far.
-function periodDates(lastDayMoment, unit) {
-    const dates = [];
-    const d = lastDayMoment.clone().startOf(unit);
-    const last = lastDayMoment.clone().startOf('day');
-    while (d.isSameOrBefore(last)) {
-        dates.push(d.clone());
-        d.add(1, 'day');
+// Heading used when a header embed's text is copied into a review note: the
+// linked section name (or file name), capitalized — "Goals" for
+// ![[goals#goals]].
+function embedHeadingLabel(embed) {
+    const m = (embed || '').match(/\[\[([^\]]+)\]\]/);
+    if (!m) return 'Goals';
+    const target = m[1].split('|')[0];
+    const hashIdx = target.indexOf('#');
+    const name = (hashIdx >= 0
+        ? target.slice(hashIdx + 1).replace(/^#+/, '')
+        : target.split('/').pop().replace(/\.md$/, '')).trim();
+    return name ? name[0].toUpperCase() + name.slice(1) : 'Goals';
+}
+
+// Start of the period containing `m`. Kinds with `yearsSpan` (decade/century)
+// have no moment unit; floor the year to the span boundary instead.
+function periodStart(k, m) {
+    if (k.yearsSpan) {
+        const y = Math.floor(m.year() / k.yearsSpan) * k.yearsSpan;
+        return m.clone().year(y).startOf('year');
     }
-    return dates;
+    return m.clone().startOf(k.unit);
+}
+
+// `m` shifted by `n` periods of kind `k` (n may be negative).
+function addPeriods(k, m, n) {
+    return m.clone().add(n * (k.yearsSpan || 1), k.yearsSpan ? 'year' : k.addUnit);
+}
+
+// The stamp naming the period containing `m` — the review note's filename and
+// the data.json done-marker.
+function periodStampOf(k, m) {
+    return k.stamp ? k.stamp(periodStart(k, m)) : m.format(k.stampFormat);
+}
+
+function ordinal(n) {
+    const tens = n % 100;
+    if (tens >= 11 && tens <= 13) return `${n}th`;
+    const suffix = { 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th';
+    return `${n}${suffix}`;
 }
 
 async function callClaude(apiKey, model, system, userContent) {
@@ -1591,34 +1632,55 @@ async function callClaude(apiKey, model, system, userContent) {
     return { ok: true, status: res.status, text: block ? block.text : '' };
 }
 
-// System prompt shared by the weekly and monthly reviews; `period` is the word
-// for the span being reviewed ('week' or 'month').
-function reviewSystem(period, hasGoals) {
+// System prompt shared by all the periodic reviews; `k` is a REVIEW_KINDS
+// entry and `sourceDesc` names the input granularity ('daily notes' or e.g.
+// 'weekly reviews' when a long span fell back to prior review notes).
+function reviewSystem(k, sourceDesc, hasGoals) {
     let s =
-        `You are writing a ${period}ly review from a user's Obsidian daily notes. ` +
+        `You are writing a ${k.adjLabel} review from a user's Obsidian ${sourceDesc}. ` +
         'Output GitHub-flavored markdown with the sections described below, in order, and nothing else. ' +
-        `First, \`## AI Summary\` — a concise prose recap of the ${period}'s themes, progress, and notable events. `;
+        `First, \`## AI Summary\` — a concise prose recap of the ${k.noun}'s themes, progress, and notable events. `;
     if (hasGoals) {
         s +=
             'Then, `## Review Questions` — under it, write exactly one reflective question per goal ' +
             'provided to you, in the same order as the goals. Render each question as its own `###` heading ' +
             '(the heading text is the question itself), followed by a blank line so the user can write their ' +
             'answer underneath. Each question should prompt the user to assess their progress on that goal ' +
-            `this ${period}, grounded in what the notes show. One question per goal, no more, no fewer. `;
+            `this ${k.noun}, grounded in what the notes show. One question per goal, no more, no fewer. `;
+    }
+    if (sourceDesc !== 'daily notes') {
+        s += 'The inputs are previously generated periodic review notes; synthesize across them rather than repeating any single one. ';
     }
     s += 'Do not invent events that are not supported by the notes.';
     return s;
 }
 
+// Reviews are sent to Claude in one request, so their input must fit the
+// model context (~200k tokens) with room left for the system prompt, the
+// goals block, and the 8k-token output. Estimated as chars/4.
+const REVIEW_INPUT_TOKEN_BUDGET = 150000;
+const REVIEW_INPUT_CHAR_BUDGET = REVIEW_INPUT_TOKEN_BUDGET * 4;
+
 // One entry per review period, driving the shared scheduling/generation code.
-// `unit` is the moment unit the period spans (startOf(unit) is its first day);
-// `addUnit` steps deadline math one period forward; `stampFormat` names the
-// review note and the data.json done-marker.
+// `unit` is the moment unit the period spans (startOf(unit) is its first day)
+// and `addUnit` steps deadline math one period forward; kinds with `yearsSpan`
+// (decade/century) have no moment unit and use floored-year math instead
+// (see periodStart/addPeriods). `stampFormat` — or the `stamp` function, for
+// spans moment can't format — names the review note and the data.json
+// done-marker. `adjLabel` is the adjective for prose ("weekly review",
+// "decade review"). `sourceLadder` lists coarser input granularities tried,
+// finest first, when the span's daily notes exceed the context budget; kinds
+// without it read daily notes only.
 const REVIEW_KINDS = {
-    week:    { noun: 'week',    unit: 'isoWeek', addUnit: 'week',    settingsKey: 'weeklyReview',    stampField: 'lastReviewWeekstamp',    stampFormat: 'GGGG-[W]WW', title: 'Weekly Review' },
-    month:   { noun: 'month',   unit: 'month',   addUnit: 'month',   settingsKey: 'monthlyReview',   stampField: 'lastReviewMonthstamp',   stampFormat: 'YYYY-MM',    title: 'Monthly Review' },
-    quarter: { noun: 'quarter', unit: 'quarter', addUnit: 'quarter', settingsKey: 'quarterlyReview', stampField: 'lastReviewQuarterstamp', stampFormat: 'YYYY-[Q]Q',  title: 'Quarterly Review' },
-    year:    { noun: 'year',    unit: 'year',    addUnit: 'year',    settingsKey: 'yearlyReview',    stampField: 'lastReviewYearstamp',    stampFormat: 'YYYY',       title: 'Yearly Review' },
+    week:    { noun: 'week',    adjLabel: 'weekly',    unit: 'isoWeek', addUnit: 'week',    settingsKey: 'weeklyReview',    stampField: 'lastReviewWeekstamp',    stampFormat: 'GGGG-[W]WW', title: 'Weekly Review' },
+    month:   { noun: 'month',   adjLabel: 'monthly',   unit: 'month',   addUnit: 'month',   settingsKey: 'monthlyReview',   stampField: 'lastReviewMonthstamp',   stampFormat: 'YYYY-MM',    title: 'Monthly Review' },
+    quarter: { noun: 'quarter', adjLabel: 'quarterly', unit: 'quarter', addUnit: 'quarter', settingsKey: 'quarterlyReview', stampField: 'lastReviewQuarterstamp', stampFormat: 'YYYY-[Q]Q',  title: 'Quarterly Review' },
+    year:    { noun: 'year',    adjLabel: 'yearly',    unit: 'year',    addUnit: 'year',    settingsKey: 'yearlyReview',    stampField: 'lastReviewYearstamp',    stampFormat: 'YYYY',       title: 'Yearly Review',
+               sourceLadder: ['week', 'month', 'quarter'] },
+    decade:  { noun: 'decade',  adjLabel: 'decade',    yearsSpan: 10,   settingsKey: 'decadeReview',  stampField: 'lastReviewDecadestamp',  stamp: (s) => `${s.year()}s`, title: 'Decade Review',
+               sourceLadder: ['week', 'month', 'quarter', 'year'] },
+    century: { noun: 'century', adjLabel: 'century',   yearsSpan: 100,  settingsKey: 'centuryReview', stampField: 'lastReviewCenturystamp', stamp: (s) => `${ordinal(s.year() / 100 + 1)} Century`, title: 'Century Review',
+               sourceLadder: ['week', 'month', 'quarter', 'year', 'decade'] },
 };
 
 class DrakeFactotumPlugin extends obsidian.Plugin {
@@ -1831,6 +1893,8 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         this.settings.monthlyReview = Object.assign({}, DEFAULT_SETTINGS.monthlyReview, data?.monthlyReview);
         this.settings.quarterlyReview = Object.assign({}, DEFAULT_SETTINGS.quarterlyReview, data?.quarterlyReview);
         this.settings.yearlyReview = Object.assign({}, DEFAULT_SETTINGS.yearlyReview, data?.yearlyReview);
+        this.settings.decadeReview = Object.assign({}, DEFAULT_SETTINGS.decadeReview, data?.decadeReview);
+        this.settings.centuryReview = Object.assign({}, DEFAULT_SETTINGS.centuryReview, data?.centuryReview);
         // The API key/model used to live under weeklyReview; they're now shared
         // with the monthly review. Migrate old data forward, then drop the old
         // fields so the next save leaves a single copy of the key.
@@ -2006,7 +2070,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     // on its last day.
     nextReviewDeadline(kind) {
         const k = REVIEW_KINDS[kind];
-        return obsidian.moment().startOf(k.unit).add(1, k.addUnit);
+        return addPeriods(k, periodStart(k, obsidian.moment()), 1);
     }
 
     // (Re)arm a timer toward the period-close boundary, review the period that
@@ -2020,8 +2084,8 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const k = REVIEW_KINDS[kind];
         if (!this.settings[k.settingsKey].enabled) return;
         const now = obsidian.moment();
-        const next = this.nextReviewDeadline(kind);
-        if (next.isSameOrBefore(now)) next.add(1, k.addUnit);
+        let next = this.nextReviewDeadline(kind);
+        if (next.isSameOrBefore(now)) next = addPeriods(k, next, 1);
         // The period to review is the one that just closed; its last day is the
         // day before the boundary. Capture it so a late-firing timer (e.g.
         // after a sleep/wake) still reviews that period rather than rolling
@@ -2034,7 +2098,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             // period has actually closed, and never re-review one already
             // stamped. Otherwise just re-arm with the recomputed delay.
             if (obsidian.moment().isSameOrAfter(next) &&
-                this.settings[k.settingsKey][k.stampField] !== target.format(k.stampFormat)) {
+                this.settings[k.settingsKey][k.stampField] !== periodStampOf(k, target)) {
                 await this.generateReview(kind, `scheduled ${kind}-close 12AM`, target);
             }
             this.scheduleReview(kind);
@@ -2043,31 +2107,102 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
 
     // If a period-close run was missed (Obsidian closed at the boundary), catch
     // up on open by generating for the most recent period that already closed.
+    // For long spans this reaches far back: enabling the decade review in 2026
+    // targets the 2010s — same semantics as enabling yearly mid-year. A span
+    // with no source notes writes nothing and sets no stamp, so it re-scans
+    // (cheaply) each startup until notes exist.
     async maybeCatchUpReview(kind) {
         const k = REVIEW_KINDS[kind];
         if (!this.settings[k.settingsKey].enabled) return;
         const now = obsidian.moment();
-        const deadline = this.nextReviewDeadline(kind);
-        if (deadline.isAfter(now)) deadline.subtract(1, k.addUnit);
+        let deadline = this.nextReviewDeadline(kind);
+        if (deadline.isAfter(now)) deadline = addPeriods(k, deadline, -1);
         // The just-closed period's last day is the day before that boundary.
         const target = deadline.clone().subtract(1, 'day');
-        if (this.settings[k.settingsKey][k.stampField] !== target.format(k.stampFormat)) {
+        if (this.settings[k.settingsKey][k.stampField] !== periodStampOf(k, target)) {
             await this.generateReview(kind, 'catch-up on open', target);
         }
     }
 
     // The `### <day>` sections Claude reads: one per existing, non-empty daily
-    // note among `dates`. Shared by the weekly and monthly reviews.
-    async collectDailySections(config, dates) {
+    // note from `startM` through `lastM` (inclusive). Stops reading once the
+    // running size passes `budgetChars` and reports `over: true` so the caller
+    // can fall back to a coarser granularity — a century's daily rung is
+    // ~36,500 dates, so walk one mutating moment rather than an array of them.
+    async collectDailySections(config, startM, lastM, budgetChars = Infinity) {
         const sections = [];
-        for (const d of dates) {
+        let chars = 0;
+        const d = startM.clone();
+        const last = lastM.clone().startOf('day');
+        while (d.isSameOrBefore(last)) {
             const file = this.app.vault.getAbstractFileByPath(dailyNotePath(config, d));
-            if (!(file instanceof obsidian.TFile)) continue;
-            const body = stripFrontmatter(await this.app.vault.cachedRead(file)).trim();
-            if (!body) continue;
-            sections.push(`### ${d.format('dddd, YYYY-MM-DD')}\n${body}`);
+            if (file instanceof obsidian.TFile) {
+                const body = stripFrontmatter(await this.app.vault.cachedRead(file)).trim();
+                if (body) {
+                    const section = `### ${d.format('dddd, YYYY-MM-DD')}\n${body}`;
+                    chars += section.length + 2;
+                    if (chars > budgetChars) return { sections, over: true };
+                    sections.push(section);
+                }
+            }
+            d.add(1, 'day');
         }
-        return sections;
+        return { sections, over: false };
+    }
+
+    // `### <stamp>` sections from another kind's already-generated review notes
+    // covering [spanStart .. lastDay]. Enumerates every period of `sourceKind`
+    // overlapping the span and reads the canonical (un-suffixed) note in that
+    // kind's configured folder — even if that kind is disabled, since notes
+    // may exist from past or manual runs. The period containing the span start
+    // is included whole (the ISO week holding a decade's Jan 1 can reach a few
+    // days into the prior decade — harmless, and simpler than clipping).
+    async collectReviewSections(sourceKind, spanStart, lastDay, budgetChars = Infinity) {
+        const gk = REVIEW_KINDS[sourceKind];
+        const folder = this.settings[gk.settingsKey].folder;
+        const sections = [];
+        let chars = 0;
+        let m = periodStart(gk, spanStart);
+        while (m.isSameOrBefore(lastDay)) {
+            const stamp = periodStampOf(gk, m);
+            const file = this.app.vault.getAbstractFileByPath(reviewNotePath(folder, stamp));
+            if (file instanceof obsidian.TFile) {
+                const body = stripFrontmatter(await this.app.vault.cachedRead(file)).trim();
+                if (body) {
+                    const section = `### ${stamp}\n${body}`;
+                    chars += section.length + 2;
+                    if (chars > budgetChars) return { sections, over: true };
+                    sections.push(section);
+                }
+            }
+            m = addPeriods(gk, m, 1);
+        }
+        return { sections, over: false };
+    }
+
+    // The review's input, at the finest granularity that fits the context
+    // budget: daily notes first, then each coarser rung of k.sourceLadder
+    // (weekly reviews, monthly, …). Empty rungs are skipped; if every
+    // non-empty rung overflows, the last one is used truncated at the budget
+    // (chronological head). `sections` is empty if no source notes exist at
+    // any granularity.
+    async collectLadderSections(kind, config, spanStart, lastDay) {
+        const k = REVIEW_KINDS[kind];
+        const rungs = ['day', ...(k.sourceLadder || [])];
+        let lastOverflow = null;
+        for (const rung of rungs) {
+            const label = rung === 'day' ? 'daily notes' : `${REVIEW_KINDS[rung].adjLabel} reviews`;
+            const { sections, over } = rung === 'day'
+                ? await this.collectDailySections(config, spanStart, lastDay, REVIEW_INPUT_CHAR_BUDGET)
+                : await this.collectReviewSections(rung, spanStart, lastDay, REVIEW_INPUT_CHAR_BUDGET);
+            if (over) { lastOverflow = { sections, label }; continue; }
+            if (sections.length > 0) return { sections, sourceLabel: label };
+        }
+        if (lastOverflow) {
+            console.warn(`Factotum — ${kind} review input exceeds the context budget at every granularity; truncating the ${lastOverflow.label}.`);
+            return { sections: lastOverflow.sections, sourceLabel: lastOverflow.label };
+        }
+        return { sections: [], sourceLabel: 'daily notes' };
     }
 
     async generateReview(kind, reason, lastDayMoment = null, notify = false) {
@@ -2075,7 +2210,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const s = this.settings[k.settingsKey];
         if (!s.enabled) return;
         if (!this.settings.anthropic.apiKey) {
-            if (notify) new obsidian.Notice(`Factotum: the ${k.noun}ly review needs an Anthropic API key.`);
+            if (notify) new obsidian.Notice(`Factotum: the ${k.adjLabel} review needs an Anthropic API key.`);
             return;
         }
         const config = getDailyNoteConfig(this.app);
@@ -2086,10 +2221,11 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
 
         // Scheduled/catch-up runs pass the closed period's last day; manual
         // runs anchor at today, reviewing the current period's days so far
-        // (periodDates() stops at the anchor day).
+        // (collection stops at the anchor day).
         const day = lastDayMoment || obsidian.moment();
-        const stamp = day.format(k.stampFormat);
-        const dates = periodDates(day, k.unit);
+        const stamp = periodStampOf(k, day);
+        const spanStart = periodStart(k, day);
+        const lastDay = day.clone().startOf('day');
 
         // The review note file is the durable, synced source of truth for
         // "this period is reviewed" — not the stamp field, which lives in
@@ -2104,14 +2240,14 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             return;
         }
 
-        const sections = await this.collectDailySections(config, dates);
+        const { sections, sourceLabel } = await this.collectLadderSections(kind, config, spanStart, lastDay);
 
         if (sections.length === 0) {
             // Don't stamp the period as done — notes may just not be available
             // yet (vault still indexing, or sync lag from another device).
             // Leaving the stamp unset lets a later open re-scan and review once
             // notes arrive.
-            if (notify) new obsidian.Notice(`Factotum: no daily notes found for ${stamp}.`);
+            if (notify) new obsidian.Notice(`Factotum: no source notes found for ${stamp}.`);
             return;
         }
 
@@ -2120,15 +2256,18 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const goalsBlock = goalsText
             ? `\n\nThe user's goals (write exactly one review question for each):\n${goalsText}`
             : '';
-        const range = `${dates[0].format('YYYY-MM-DD')} to ${dates[dates.length - 1].format('YYYY-MM-DD')}`;
-        const userContent = `Daily notes for the ${k.noun} of ${stamp} (${range}):\n\n${sections.join('\n\n')}${goalsBlock}`;
+        const range = `${spanStart.format('YYYY-MM-DD')} to ${lastDay.format('YYYY-MM-DD')}`;
+        // "the week of 2026-W23" reads well; "the decade of 2020s" doesn't.
+        const spanPhrase = k.yearsSpan ? `the ${k.noun} ${stamp}` : `the ${k.noun} of ${stamp}`;
+        const sourceIntro = sourceLabel[0].toUpperCase() + sourceLabel.slice(1);
+        const userContent = `${sourceIntro} for ${spanPhrase} (${range}):\n\n${sections.join('\n\n')}${goalsBlock}`;
 
-        new obsidian.Notice(`Factotum: generating ${k.noun}ly review for ${stamp}…`);
+        new obsidian.Notice(`Factotum: generating ${k.adjLabel} review for ${stamp}…`);
         let result;
         try {
-            result = await callClaude(this.settings.anthropic.apiKey, this.settings.anthropic.model, reviewSystem(k.noun, !!goalsText), userContent);
+            result = await callClaude(this.settings.anthropic.apiKey, this.settings.anthropic.model, reviewSystem(k, sourceLabel, !!goalsText), userContent);
         } catch (e) {
-            new obsidian.Notice(`Factotum: ${k.noun}ly review request failed (network error).`);
+            new obsidian.Notice(`Factotum: ${k.adjLabel} review request failed (network error).`);
             console.error('Factotum — Claude request failed', e);
             return;
         }
@@ -2146,21 +2285,31 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         }
 
         const generated = obsidian.moment().format('YYYY-MM-DD HH:mm');
-        const embed = s.headerEmbed ? `${s.headerEmbed}\n\n` : '';
-        const note = `---\n${kind}: ${stamp}\nrange: ${range}\ngenerated: ${generated}\n---\n\n# ${k.title} — ${stamp}\n\n${embed}${reviewBody}\n`;
+        // Copy the linked section's current text into the note rather than
+        // writing a live ![[...]] embed: goals drift over time, and each
+        // review should preserve what they were when it was written. If the
+        // link doesn't resolve, fall back to the literal embed.
+        let embed = '';
+        if (s.headerEmbed) {
+            const headerText = await readEmbeddedSection(this.app, s.headerEmbed);
+            embed = headerText
+                ? `## ${embedHeadingLabel(s.headerEmbed)}\n\n${headerText}\n\n`
+                : `${s.headerEmbed}\n\n`;
+        }
+        const note = `---\n${kind}: ${stamp}\nrange: ${range}\nsource: ${sourceLabel}\ngenerated: ${generated}\n---\n\n# ${k.title} — ${stamp}\n\n${embed}${reviewBody}\n`;
 
         try {
             const file = await this.writeReviewNote(s.folder, stamp, note);
             s[k.stampField] = stamp;
             await this.saveSettings();
-            new obsidian.Notice(`Factotum: ${k.noun}ly review for ${stamp} saved ✓`);
+            new obsidian.Notice(`Factotum: ${k.adjLabel} review for ${stamp} saved ✓`);
             if (notify && file) {
                 this.app.workspace.getLeaf(true).openFile(file)
                     .catch(e => console.error('Factotum — could not open review note', e));
             }
         } catch (e) {
-            new obsidian.Notice(`Factotum: could not write the ${k.noun}ly review note.`);
-            console.error(`Factotum — ${k.noun}ly review write failed`, e);
+            new obsidian.Notice(`Factotum: could not write the ${k.adjLabel} review note.`);
+            console.error(`Factotum — ${k.adjLabel} review write failed`, e);
         }
     }
 
@@ -2299,7 +2448,7 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
             .setHeading();
 
         containerEl.createEl('p', {
-            text: 'The "Prioritize with Claude" command and the periodic reviews below (weekly, monthly, quarterly, yearly) use Claude via the Anthropic API (a few cents per run) and share this API key and model.',
+            text: 'The "Prioritize with Claude" command and the periodic reviews below (weekly, monthly, quarterly, yearly, decade, century) use Claude via the Anthropic API (a few cents per run) and share this API key and model.',
             cls: 'ordinal-hint',
         });
 
@@ -2327,6 +2476,8 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
             month:   { label: 'Monthly review',   when: 'midnight on the 1st of each month',                             example: '2026-06.md' },
             quarter: { label: 'Quarterly review', when: 'midnight on the first day of each quarter (Jan/Apr/Jul/Oct 1)', example: '2026-Q2.md' },
             year:    { label: 'Yearly review',    when: 'midnight on January 1st',                                       example: '2026.md' },
+            decade:  { label: 'Decade review',    when: 'midnight on January 1st of years ending in 0 (2030, 2040, …)',  example: '2020s.md' },
+            century: { label: 'Century review',   when: 'midnight on January 1st of years ending in 00 (2100)',          example: '21st Century.md' },
         };
         for (const [kind, ui] of Object.entries(reviewUi)) {
             const k = REVIEW_KINDS[kind];
@@ -2336,13 +2487,16 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
                 .setName(ui.label)
                 .setHeading();
 
+            const ladderHint = k.sourceLadder
+                ? ` A full ${k.noun} of daily notes usually exceeds Claude's context window, so it automatically falls back to the finest review notes that fit — ${k.sourceLadder.map(r => REVIEW_KINDS[r].adjLabel).join(', then ')} reviews, read from those reviews' configured folders.`
+                : '';
             containerEl.createEl('p', {
-                text: `Just after ${ui.when}, summarize the past ${k.noun}'s daily notes with Claude and write a review note (AI summary, then one review question per goal) to your chosen folder. If the app was closed at the time — including on mobile, where it runs when you next open Obsidian — it catches up on the next open.`,
+                text: `Just after ${ui.when}, summarize the past ${k.noun}'s daily notes with Claude and write a review note (AI summary, then one review question per goal) to your chosen folder. If the app was closed at the time — including on mobile, where it runs when you next open Obsidian — it catches up on the next open.${ladderHint}`,
                 cls: 'ordinal-hint',
             });
 
             new obsidian.Setting(containerEl)
-                .setName(`Enable ${k.noun}ly review`)
+                .setName(`Enable ${k.adjLabel} review`)
                 .setDesc(`Generate automatically when the ${k.noun} closes, with catch-up on startup.`)
                 .addToggle(t => t
                     .setValue(s.enabled)
@@ -2362,7 +2516,7 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
 
             new obsidian.Setting(containerEl)
                 .setName('Header embed (optional)')
-                .setDesc('Inserted at the top of every review, above the AI summary. Defaults to an embed of your goals note. Leave blank to omit.')
+                .setDesc('A wiki link like ![[goals#goals]] whose linked section\'s current text is copied to the top of every review, above the AI summary — preserving your goals as they were when the review was written. Leave blank to omit.')
                 .addText(t => t
                     .setPlaceholder('![[goals#goals]]')
                     .setValue(s.headerEmbed)
