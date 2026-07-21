@@ -2205,7 +2205,10 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         return { sections: [], sourceLabel: 'daily notes' };
     }
 
-    async generateReview(kind, reason, lastDayMoment = null, notify = false) {
+    // `recordStamp: false` is for reviews of long-past periods: they must not
+    // write their (old) stamp into the done-marker, which tracks the current
+    // scheduling cycle.
+    async generateReview(kind, reason, lastDayMoment = null, notify = false, recordStamp = true) {
         const k = REVIEW_KINDS[kind];
         const s = this.settings[k.settingsKey];
         if (!s.enabled) return;
@@ -2300,8 +2303,10 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
 
         try {
             const file = await this.writeReviewNote(s.folder, stamp, note);
-            s[k.stampField] = stamp;
-            await this.saveSettings();
+            if (recordStamp) {
+                s[k.stampField] = stamp;
+                await this.saveSettings();
+            }
             new obsidian.Notice(`Factotum: ${k.adjLabel} review for ${stamp} saved ✓`);
             if (notify && file) {
                 this.app.workspace.getLeaf(true).openFile(file)
@@ -2536,6 +2541,34 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
                 .addButton(btn => btn
                     .setButtonText('Generate now')
                     .onClick(() => this.plugin.generateReview(kind, 'manual', null, true)));
+
+            let pastDate = '';
+            new obsidian.Setting(containerEl)
+                .setName(`Generate a past ${k.noun}'s review`)
+                .setDesc(`Build the review for the ${k.noun} containing the given date — e.g. 2019, 2019-06, or 2019-06-15 — from the notes of that time. Doesn't touch the schedule; an existing note gets a numbered sibling.`)
+                .addText(t => t
+                    .setPlaceholder('YYYY-MM-DD')
+                    .onChange(v => { pastDate = v.trim(); }))
+                .addButton(btn => btn
+                    .setButtonText('Generate past review')
+                    .onClick(() => {
+                        const m = obsidian.moment(pastDate, ['YYYY-MM-DD', 'YYYY-MM', 'YYYY'], true);
+                        if (!m.isValid()) {
+                            new obsidian.Notice('Factotum: enter a date like 2019, 2019-06, or 2019-06-15.');
+                            return;
+                        }
+                        const today = obsidian.moment().startOf('day');
+                        const start = periodStart(k, m);
+                        if (start.isAfter(today)) {
+                            new obsidian.Notice(`Factotum: that ${k.noun} hasn't started yet.`);
+                            return;
+                        }
+                        // Anchor at the period's last day — or today for the
+                        // current period, mirroring "Generate now".
+                        let lastDay = addPeriods(k, start, 1).subtract(1, 'day');
+                        if (lastDay.isAfter(today)) lastDay = today;
+                        this.plugin.generateReview(kind, 'manual past', lastDay, true, false);
+                    }));
         }
     }
 }
