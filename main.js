@@ -46,6 +46,26 @@ function withDoneTags(text, quadrant) {
 
 // ── Markdown parsing / serialization ────────────────────────────────────────
 
+// Markdown (and Obsidian's editor) treats a bullet indented up to three
+// spaces as still top-level, so the note can render as a plain list while a
+// column-0-only match misses every item. A line belongs to an item's nested
+// block only when indented past the item's own bullet; tabs count four wide.
+const BULLET_RE = /^( {0,3})[-*+] (.+)$/;
+
+function indentWidth(line) {
+    let w = 0;
+    for (const ch of line) {
+        if (ch === ' ') w += 1;
+        else if (ch === '\t') w += 4;
+        else break;
+    }
+    return w;
+}
+
+function isNestedLine(line, bulletIndent) {
+    return /^\s+\S/.test(line) && indentWidth(line) > bulletIndent;
+}
+
 function parseNote(content) {
     const lines = content.split('\n');
 
@@ -68,16 +88,17 @@ function parseNote(content) {
         while (i < lines.length) {
             const h = lines[i].match(/^#{1,6}\s+(.+)$/);
             if (h) { inInbox = classifyHeading(h[1]) === 'inbox'; i++; continue; }
-            const m = lines[i].match(/^[-*+] (.+)$/);
+            const m = lines[i].match(BULLET_RE);
             if (!m) { i++; continue; }
-            // A top-level bullet owns the contiguous indented lines below it
-            // (nested bullets, sub-tasks, continuation text). They travel with
-            // it as a block so sorting preserves nested structure.
+            // A top-level bullet owns the contiguous deeper-indented lines
+            // below it (nested bullets, sub-tasks, continuation text). They
+            // travel with it as a block so sorting preserves nested structure.
+            const indent = m[1].length;
             const children = [];
             let j = i + 1;
-            while (j < lines.length && /^\s+\S/.test(lines[j])) { children.push(lines[j]); j++; }
+            while (j < lines.length && isNestedLine(lines[j], indent)) { children.push(lines[j]); j++; }
             i = j;
-            let text = m[1].trim();
+            let text = m[2].trim();
             const doneMatch = text.match(/^\[[xX]\]\s+(.+)$/);
             if (doneMatch) { done.push({ text: doneMatch[1], isTask: true, children }); continue; }
             let isTask = false;
@@ -94,6 +115,7 @@ function parseNote(content) {
     let section = 'preamble';
     let sawQuadrant = false;
     let lastItem = null;
+    let lastIndent = 0;
     const preamble = [];
 
     for (const line of lines) {
@@ -106,12 +128,13 @@ function parseNote(content) {
             continue;
         }
 
-        // Indented lines below a bullet are its nested block — keep them with it.
-        if (lastItem && /^\s+\S/.test(line)) { lastItem.children.push(line); continue; }
+        // Lines indented past a bullet are its nested block — keep them with it.
+        if (lastItem && isNestedLine(line, lastIndent)) { lastItem.children.push(line); continue; }
 
-        const bulletMatch = line.match(/^[-*+] (.+)$/);
+        const bulletMatch = line.match(BULLET_RE);
         if (bulletMatch) {
-            let text = bulletMatch[1].trim();
+            lastIndent = bulletMatch[1].length;
+            let text = bulletMatch[2].trim();
             const doneMatch = text.match(/^\[[xX]\]\s+(.+)$/);
             if (doneMatch) {
                 const quadrant = QUADRANTS.find(q => q.key === section);
@@ -185,30 +208,33 @@ function serializeFlat(content, sortedItems, inboxItems = null) {
             if (cls === 'done')  { hadDone = true;  i++; continue; }
             body.push(line);
             i++;
-        } else if (/^[-*+] \[[xX]\]\s/.test(line)) {
+        } else if (/^ {0,3}[-*+] \[[xX]\]\s/.test(line)) {
             // Done item: keep its block verbatim and stash it for the Done section.
+            const indent = indentWidth(line);
             const block = [line];
             i++;
-            while (i < lines.length && /^\s+\S/.test(lines[i])) { block.push(lines[i]); i++; }
+            while (i < lines.length && isNestedLine(lines[i], indent)) { block.push(lines[i]); i++; }
             doneBlocks.push(block);
         } else if (inInbox) {
             // The Inbox section travels to the top as-is. Its bullets are
             // unranked and don't participate in sorting — unless the caller
             // is rewriting the Inbox, in which case they're replaced.
-            if (/^[-*+] /.test(line)) {
+            if (BULLET_RE.test(line)) {
+                const indent = indentWidth(line);
                 const block = [line];
                 i++;
-                while (i < lines.length && /^\s+\S/.test(lines[i])) { block.push(lines[i]); i++; }
+                while (i < lines.length && isNestedLine(lines[i], indent)) { block.push(lines[i]); i++; }
                 if (!inboxItems) inboxBlock.push(...block);
             } else {
                 if (line.trim() !== '') inboxBlock.push(line);
                 i++;
             }
-        } else if (/^[-*+] /.test(line)) {
+        } else if (BULLET_RE.test(line)) {
             // Active bullet: swap in the next ranked block, dropping the original
             // nested lines (they ride along inside the replacement block).
+            const indent = indentWidth(line);
             i++;
-            while (i < lines.length && /^\s+\S/.test(lines[i])) i++;
+            while (i < lines.length && isNestedLine(lines[i], indent)) i++;
             if (idx < replacements.length) {
                 if (firstSortedIdx < 0) firstSortedIdx = body.length;
                 body.push(...replacements[idx++]);
@@ -270,8 +296,9 @@ function extractPreamble(lines) {
     for (let i = 0; i < lines.length; i++) {
         const m = lines[i].match(/^#{1,6}\s+(.+)$/);
         if (m && classifyHeading(m[1]) !== null) break;
-        if (/^[-*+] /.test(lines[i])) {
-            while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) i++;
+        if (BULLET_RE.test(lines[i])) {
+            const indent = indentWidth(lines[i]);
+            while (i + 1 < lines.length && isNestedLine(lines[i + 1], indent)) i++;
             continue;
         }
         preamble.push(lines[i]);
