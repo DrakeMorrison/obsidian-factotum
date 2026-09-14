@@ -51,6 +51,12 @@ Type your new item, then answer ~log₂(n) comparisons to slot it in the right p
 
 By default this works on the note you're currently viewing. To always add to one designated TODO note no matter which note is open, set a **TODO note path** in **Settings → Factotum** (e.g. `TODO.md`). The command then targets that note from anywhere — and stays available even when no note is open. Leave the path blank to keep the original "current note" behavior.
 
+### Categorizing already-done items
+
+> **Factotum: Categorize done items (tag urgent/important for Claude calibration)**
+
+Items checked off inside a quadrant carry `#urgent` / `#important` (or `#neither`) into Done automatically — landing at the top, so Done reads newest-first — and the Claude prioritizer sends the whole Done section along to learn how you classify work. Items that were finished before the matrix existed have no tags, so they teach it nothing. This command walks the untagged Done items, newest first, and asks one four-way question per item — **1** Urgent & Important, **2** Important only, **3** Urgent only, **4** Neither, **s** to skip. Tags are appended to the existing lines; nothing else in the note moves. Close anytime and the items already answered are saved; run it again to continue.
+
 ### Inbox: capture now, prioritize later
 
 Add an `## Inbox` heading to your TODO note and toss unprioritized bullets under it as they occur to you (the [nightly sweep](#nightly-to-do-sweep--inbox) can fill it from your daily notes too). The Inbox lives at the **top** of the note, with a `## TODO` heading below it marking where the ranked list starts — the plugin adds the TODO heading (and keeps both sections in place) whenever it saves. Inbox items are ignored by ranking sessions — they hold no rank until you triage them. When you're ready:

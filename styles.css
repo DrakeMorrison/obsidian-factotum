@@ -98,6 +98,27 @@ body.is-mobile .modal.ordinal-modal {
     background: var(--background-modifier-active-hover);
 }
 
+/* Four-way category grid (categorize done items) */
+.ordinal-grid.ordinal-grid-2x2 {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.ordinal-grid-2x2 .ordinal-choice {
+    min-height: 64px;
+}
+
+.ordinal-key {
+    display: inline-block;
+    min-width: 1.4em;
+    margin-right: 8px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--background-modifier-border);
+    color: var(--text-muted);
+    font-family: var(--font-monospace);
+    font-size: 0.8em;
+}
+
 /* Skip button */
 .ordinal-skip {
     display: block;

@@ -41,6 +41,7 @@ function withDoneTags(text, quadrant) {
     let out = text;
     if (quadrant.urgent && !/(^|\s)#urgent\b/.test(out)) out += ' #urgent';
     if (quadrant.important && !/(^|\s)#important\b/.test(out)) out += ' #important';
+    if (!quadrant.urgent && !quadrant.important && !/(^|\s)#(urgent|important|neither)\b/.test(out)) out += ' #neither';
     return out;
 }
 
@@ -1296,8 +1297,9 @@ class ClaudePrioritizeModal extends obsidian.Modal {
             'You will receive a numbered list of tasks. Assign EVERY task number to exactly one quadrant ' +
             'and order each quadrant from highest to lowest priority. ' +
             'Each task may note where it currently sits — treat that as a mild prior, not a constraint. ' +
-            'If recently completed tasks are provided, their #urgent/#important tags show how the user ' +
-            'tends to classify similar work. ' +
+            'If completed tasks are provided (newest first), their #urgent/#important tags show how the user ' +
+            'tends to classify similar work (#neither = neither urgent nor important; a completed task ' +
+            'with no tags was never classified, so read nothing into it). ' +
             'Respond with ONLY a JSON object of the form {"Q1":[3,0],"Q2":[2],"Q3":[],"Q4":[1]} — ' +
             'no prose, no code fences. Every input number must appear exactly once across the four arrays.';
 
@@ -1307,10 +1309,11 @@ class ClaudePrioritizeModal extends obsidian.Modal {
             return s;
         });
         let user = `Tasks to prioritize:\n\n${taskLines.join('\n')}`;
-        const recentDone = this.doneItems.slice(-30);
-        if (recentDone.length > 0) {
-            user += `\n\nRecently completed (for calibration only — do not include these numbers):\n` +
-                recentDone.map(d => `- ${d.text}`).join('\n');
+        // The whole Done section, newest first — that's the order the note
+        // keeps it in, since a freshly checked item lands at the head.
+        if (this.doneItems.length > 0) {
+            user += `\n\nCompleted tasks, newest first (for calibration only — do not include these numbers):\n` +
+                this.doneItems.map(d => `- ${d.text}`).join('\n');
         }
         return { system, user };
     }
@@ -1414,6 +1417,123 @@ function applyResult(editor, originalContent, result) {
 function totalActiveItems(parsed) {
     if (parsed.mode === 'flat') return parsed.items.length;
     return QUADRANTS.reduce((sum, q) => sum + parsed.sections[q.key].length, 0);
+}
+
+// ── Categorize done items (backfill #urgent/#important tags) ────────────────
+// Items checked off inside a quadrant carry their classification into Done
+// as tags; items that pre-date the matrix (or were checked off outside one)
+// don't. This walks the untagged ones and asks a single four-way question
+// per item, so Claude's prioritization has a fuller calibration set.
+
+const DONE_TAG_RE = /(^|\s)#(urgent|important|neither)\b/;
+
+function hasDoneTags(text) {
+    return DONE_TAG_RE.test(text);
+}
+
+const DONE_CATEGORIES = [
+    { key: '1', label: 'Urgent & Important', tags: ' #urgent #important' },
+    { key: '2', label: 'Important only',     tags: ' #important' },
+    { key: '3', label: 'Urgent only',        tags: ' #urgent' },
+    { key: '4', label: 'Neither',            tags: ' #neither' },
+];
+
+// Append tags to the `- [x]` lines whose text matches a decided item. Lines
+// are rewritten in place — the rest of the note is untouched byte-for-byte —
+// so this works the same in flat and matrix notes. Duplicate lines with the
+// same text all receive the same tags.
+function tagDoneLines(content, decisions) {
+    if (decisions.size === 0) return content;
+    return content.split('\n').map(line => {
+        const m = line.match(/^( {0,3}[-*+] \[[xX]\]\s+)(.*?)(\s*)$/);
+        if (!m) return line;
+        const text = m[2].trim();
+        if (hasDoneTags(text)) return line;
+        const tags = decisions.get(text);
+        return tags === undefined ? line : `${m[1]}${text}${tags}`;
+    }).join('\n');
+}
+
+class CategorizeDoneModal extends obsidian.Modal {
+    constructor(app, doneItems, onComplete) {
+        super(app);
+        this.onComplete = onComplete;
+        this.finished = false;
+        // Done is kept newest-first (a freshly checked item lands at its
+        // head), so walking in order asks about recent work first. Each
+        // distinct text is asked once.
+        const seen = new Set();
+        this.texts = [];
+        for (const item of doneItems) {
+            const text = item.text.trim();
+            if (hasDoneTags(text) || seen.has(text)) continue;
+            seen.add(text);
+            this.texts.push(text);
+        }
+        this.idx = 0;
+        this.decisions = new Map();   // text → tags string
+        this.skipped = 0;
+    }
+
+    onOpen() {
+        this.modalEl.addClass('ordinal-modal');
+        const bind = (key, fn) => this.scope.register([], key, () => { fn(); return false; });
+        for (const c of DONE_CATEGORIES) bind(c.key, () => this.answer(c.tags));
+        bind('s', () => this.answer(null));
+        this.render();
+    }
+
+    // Closing mid-session saves what's decided so far; the rest stays
+    // untagged and shows up again next run.
+    onClose() {
+        this.contentEl.empty();
+        if (this.finished) return;
+        this.finished = true;
+        this.onComplete(this.decisions, this.idx < this.texts.length);
+    }
+
+    answer(tags) {
+        if (this.idx >= this.texts.length) return;
+        if (tags === null) this.skipped++;
+        else this.decisions.set(this.texts[this.idx], tags);
+        this.idx++;
+        this.render();
+    }
+
+    render() {
+        const { contentEl } = this;
+        contentEl.empty();
+        if (this.idx >= this.texts.length) {
+            this.finished = true;
+            this.onComplete(this.decisions, false);
+            this.close();
+            return;
+        }
+        const total = this.texts.length;
+        contentEl.createDiv({ cls: 'ordinal-quadrant-label', text: `Done item ${this.idx + 1} of ${total}` });
+        contentEl.createEl('h2', { text: this.texts[this.idx] });
+        contentEl.createEl('p', {
+            cls: 'ordinal-hint',
+            text: 'When this was open, did it have to get done that week (urgent)? Would never doing it have mattered (important)?',
+        });
+
+        const prog = contentEl.createDiv({ cls: 'ordinal-progress' });
+        prog.createDiv({ cls: 'ordinal-progress-fill' }).style.width = `${(this.idx / total) * 100}%`;
+        prog.createDiv({ cls: 'ordinal-progress-label', text: `${this.idx} / ${total}` });
+
+        const grid = contentEl.createDiv({ cls: 'ordinal-grid ordinal-grid-2x2' });
+        for (const c of DONE_CATEGORIES) {
+            const btn = grid.createEl('button', { cls: 'ordinal-choice' });
+            btn.createSpan({ cls: 'ordinal-key', text: c.key });
+            btn.createSpan({ text: c.label });
+            btn.addEventListener('click', () => this.answer(c.tags));
+        }
+
+        const skip = contentEl.createEl('button', { text: 'Skip (s)', cls: 'ordinal-skip' });
+        skip.addEventListener('click', () => this.answer(null));
+
+        closeHint(contentEl, 'Keys 1–4 answer, s skips. Close anytime — items tagged so far are saved.');
+    }
 }
 
 // ── Secrets ─────────────────────────────────────────────────────────────────
@@ -2238,6 +2358,30 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 new ClaudePrioritizeModal(this.app, parsed, { apiKey: this.anthropicApiKey(), model: this.settings.anthropic.model }, (result) => {
                     applyResult(editor, content, result);
                     new obsidian.Notice('Factotum: Claude\'s prioritization saved ✓');
+                }).open();
+            }
+        });
+
+        this.addCommand({
+            id: 'factotum-categorize-done',
+            name: 'Categorize done items (tag urgent/important for Claude calibration)',
+            editorCallback: (editor) => {
+                const content = editor.getValue();
+                const parsed  = parseNote(content);
+                const done = parsed.mode === 'flat' ? parsed.done : parsed.sections.done;
+                const untagged = done.filter(d => !hasDoneTags(d.text)).length;
+                if (untagged === 0) {
+                    new obsidian.Notice('Factotum: every done item is already tagged.');
+                    return;
+                }
+                new CategorizeDoneModal(this.app, done, (decisions, partial) => {
+                    if (decisions.size === 0) return;
+                    // Re-read: the vault syncs live and the session may have run a while.
+                    const latest = editor.getValue();
+                    editor.setValue(tagDoneLines(latest, decisions));
+                    new obsidian.Notice(partial
+                        ? `Factotum: ${decisions.size} done items tagged — run again to finish the rest.`
+                        : `Factotum: ${decisions.size} done items tagged ✓`);
                 }).open();
             }
         });
