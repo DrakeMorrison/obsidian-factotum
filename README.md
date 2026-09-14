@@ -153,7 +153,7 @@ Optionally, the plugin can sweep each day's daily note for the to-dos you wrote 
 
 The sweep uses Claude, so it finds to-dos written as prose — *"I need to remember to ask Lauren what I'm authorized to spend"*, *"gotta get an air pump before I can ride the ebike"* — not just checkboxes. Each is rewritten as a short imperative that stands on its own (`- [ ] Buy an air pump for the ebike tires ([[2026-09-12]])`), with a link back to the day it came from. Routine daily intentions (exercise, write, shave), musings, and anything the note shows was already done are left alone, and the whole TODO note is sent along as context so items already captured — in the Inbox, the ranked list, or Done — aren't added twice. A day whose note is still the untouched template costs no API call.
 
-Enable it in **Settings → Factotum → Daily to-do sweep**. It needs the **TODO note path** (top of the settings) and the shared **Anthropic API key**. The daily note is located from your **Daily Notes** or **Periodic Notes** settings, and the template is subtracted the same way the word count does it. **Sweep now** in settings, or the command palette entry
+Enable it in **Settings → Factotum → Daily to-do sweep**. It writes to the **TODO note path** (top of the settings), or to `TODO.md` at the vault root when that is left blank, and needs the shared **Anthropic API key**. The daily note is located from your **Daily Notes** or **Periodic Notes** settings, and the template is subtracted the same way the word count does it. **Sweep now** in settings, or the command palette entry
 
 > **Factotum: Sweep today's daily note for to-dos (into the TODO note's Inbox)**
 

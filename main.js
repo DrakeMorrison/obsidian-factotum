@@ -1820,7 +1820,12 @@ async function callClaude(apiKey, model, system, userContent) {
 // these journals they're mostly prose ("I need to remember to ask Lauren…",
 // "gotta pump up the bike tires"), not checkboxes — and drop them under the
 // TODO note's Inbox heading for the usual triage. The whole TODO note goes
-// along as context so already-captured items aren't re-added.
+// along as context so already-captured items aren't re-added. The sweep
+// writes to the configured TODO note, or to TODO.md at the vault root when
+// no path is set (leaving the path blank keeps "Add new item" on the
+// active note without making the sweep unconfigured).
+
+const SWEEP_DEFAULT_TODO_PATH = 'TODO.md';
 
 const SWEEP_SYSTEM =
     'You extract to-do items from one day\'s journal note in Obsidian. The note is informal, ' +
@@ -2576,10 +2581,11 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         await this.saveSettings();
     }
 
-    // Resolve the configured TODO note to a TFile, tolerating a missing ".md".
-    // Returns null if unset or the path doesn't point at a markdown file.
-    resolveTodoNote() {
-        const path = (this.settings.todoNotePath || '').trim();
+    // Resolve the configured TODO note (or `fallback` when none is set) to a
+    // TFile, tolerating a missing ".md". Returns null if there is no path or
+    // it doesn't point at a markdown file.
+    resolveTodoNote(fallback = '') {
+        const path = (this.settings.todoNotePath || '').trim() || fallback;
         if (!path) return null;
         let file = this.app.vault.getAbstractFileByPath(path);
         if (!file && !path.toLowerCase().endsWith('.md')) {
@@ -2830,9 +2836,9 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             if (notify) new obsidian.Notice('Factotum: the daily sweep needs an Anthropic API key.');
             return;
         }
-        const todoFile = this.resolveTodoNote();
+        const todoFile = this.resolveTodoNote(SWEEP_DEFAULT_TODO_PATH);
         if (!todoFile) {
-            if (notify) new obsidian.Notice('Factotum: set a TODO note path in settings first.');
+            if (notify) new obsidian.Notice(`Factotum: no TODO note — set a TODO note path in settings, or create ${SWEEP_DEFAULT_TODO_PATH}.`);
             return;
         }
         const config = getDailyNoteConfig(this.app);
@@ -3266,7 +3272,7 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
 
         new obsidian.Setting(containerEl)
             .setName('TODO note path')
-            .setDesc('"Add new item" always targets this note, regardless of which note is active. Leave blank to add to the currently open note instead.')
+            .setDesc('"Add new item" always targets this note, regardless of which note is active. Leave blank to add to the currently open note instead (the nightly sweep then uses TODO.md at the vault root).')
             .addText(t => t
                 .setPlaceholder('TODO.md')
                 .setValue(this.plugin.settings.todoNotePath)
@@ -3438,13 +3444,13 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
             .setHeading();
 
         containerEl.createEl('p', {
-            text: 'At midnight each night, read the daily note of the day that just ended, have Claude pull out the to-dos written into it (prose like "I need to remember to…" counts, not just checkboxes), and add them under the Inbox heading of the TODO note above for triage. Items already in the TODO note are skipped. Each item links back to the daily note it came from.',
+            text: 'At midnight each night, read the daily note of the day that just ended, have Claude pull out the to-dos written into it (prose like "I need to remember to…" counts, not just checkboxes), and add them under the Inbox heading of the TODO note above (TODO.md at the vault root when no path is set) for triage. Items already in the TODO note are skipped. Each item links back to the daily note it came from.',
             cls: 'ordinal-hint',
         });
 
         new obsidian.Setting(containerEl)
             .setName('Enable nightly sweep')
-            .setDesc('Sweep automatically at midnight, and catch up on startup for nights the app was closed (up to a week back). Needs the TODO note path and the API key above.')
+            .setDesc('Sweep automatically at midnight, and catch up on startup for nights the app was closed (up to a week back). Needs the API key above and a TODO note (the path above, or TODO.md).')
             .addToggle(t => t
                 .setValue(ds.enabled)
                 .onChange(async (v) => {
