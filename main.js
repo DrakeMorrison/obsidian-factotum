@@ -1416,6 +1416,29 @@ function totalActiveItems(parsed) {
     return QUADRANTS.reduce((sum, q) => sum + parsed.sections[q.key].length, 0);
 }
 
+// ── Secrets ─────────────────────────────────────────────────────────────────
+// API keys live in Obsidian's keychain (app.secretStorage, Obsidian ≥ 1.11.4):
+// encrypted with the OS keyring, kept per device in the app's config dir, never
+// inside the vault. data.json holds nothing but the settings that reference
+// them. On a build without secretStorage the value stays in data.json as it
+// always did, so the plugin keeps working on an older phone.
+const SECRET_IDS = {
+    anthropicApiKey:    'factotum-anthropic-api-key',
+    beeminderAuthToken: 'factotum-beeminder-auth-token',
+};
+
+function secretStore(app) {
+    const ss = app.secretStorage;
+    return ss && typeof ss.getSecret === 'function' && typeof ss.setSecret === 'function' ? ss : null;
+}
+
+// Where a secret is kept, for the settings description.
+function secretHomeDesc(app) {
+    return secretStore(app)
+        ? 'Kept in Obsidian\'s keychain on this device (Settings → Keychain), not in the vault or data.json. Enter it once per device.'
+        : 'This Obsidian build has no keychain, so it is stored in this plugin\'s data.json.';
+}
+
 // ── Beeminder daily word count ──────────────────────────────────────────────
 
 const DEFAULT_SETTINGS = {
@@ -1428,15 +1451,20 @@ const DEFAULT_SETTINGS = {
     },
     beeminder: {
         enabled: false,
-        authToken: '',
+        authToken: '',             // legacy plaintext; blank once moved into the keychain
         username: '',
         goalName: '',
         templatePath: '',          // optional override; blank = auto-detect
         lastSubmittedDaystamp: '', // YYYYMMDD of the last successful send
     },
     anthropic: {
-        apiKey: '',                // shared by all periodic reviews and prioritization
+        apiKey: '',                // legacy plaintext; blank once moved into the keychain. Shared by all periodic reviews, the daily sweep, and prioritization
         model: 'claude-opus-4-8',
+    },
+    dailySweep: {
+        enabled: false,
+        linkSource: true,          // append a wiki link to the daily note each item came from
+        lastSweptDaystamp: '',     // YYYYMMDD of the last nightly/catch-up sweep
     },
     weeklyReview: {
         enabled: false,
@@ -1542,10 +1570,10 @@ async function readWordCount(app, path) {
     return 0;
 }
 
-async function submitToBeeminder(s, value, daystamp, comment) {
+async function submitToBeeminder(s, authToken, value, daystamp, comment) {
     const url = `https://www.beeminder.com/api/v1/users/${encodeURIComponent(s.username)}/goals/${encodeURIComponent(s.goalName)}/datapoints.json`;
     const body = new URLSearchParams({
-        auth_token: s.authToken,
+        auth_token: authToken,
         value: String(value),
         daystamp: daystamp,
         comment: comment || '',
@@ -1664,6 +1692,78 @@ async function callClaude(apiKey, model, system, userContent) {
     }
     const block = (res.json?.content || []).find(b => b.type === 'text');
     return { ok: true, status: res.status, text: block ? block.text : '' };
+}
+
+// ── Daily to-do sweep ───────────────────────────────────────────────────────
+// Once a night — at midnight, when the day closes, same as the Beeminder
+// submission and the periodic reviews — read the ended day's daily note, have Claude pull out the to-dos written into it — in
+// these journals they're mostly prose ("I need to remember to ask Lauren…",
+// "gotta pump up the bike tires"), not checkboxes — and drop them under the
+// TODO note's Inbox heading for the usual triage. The whole TODO note goes
+// along as context so already-captured items aren't re-added.
+
+const SWEEP_SYSTEM =
+    'You extract to-do items from one day\'s journal note in Obsidian. The note is informal, ' +
+    'stream-of-consciousness writing; to-dos appear as prose ("I need to remember to ask Lauren about X", ' +
+    '"gotta pump up the bike tires before I can ride", "should book the dentist") and only occasionally as ' +
+    'checkboxes. It may follow a template with Intentions, Outcomes, and Notes sections.\n\n' +
+    'Extract the concrete, actionable tasks the writer means to do — things that could be checked off. ' +
+    'Skip: routine daily habits and intentions (exercise, write, shave, work, sleep, laundry) unless framed as ' +
+    'a specific one-off errand; vague aspirations, musings, and self-critique ("I should be more assertive"); ' +
+    'anything the Outcomes section or later text shows was already done; ideas with no commitment behind them. ' +
+    'Skip anything already present in the TODO note, in any wording — it holds an Inbox, the ranked list, and ' +
+    'completed items.\n\n' +
+    'Phrase each item as a short imperative that stands on its own out of context, keeping the writer\'s ' +
+    'specifics (names, objects, places, deadlines): "Ask Lauren what I\'m authorized to spend on hotel rooms", ' +
+    '"Buy an air pump for the ebike tires". Respond with ONLY a JSON array of strings, e.g. ' +
+    '["Buy an air pump for the ebike tires"], or [] when there is nothing new. No prose, no code fences.';
+
+// Claude's reply is a JSON array of strings; tolerate stray prose around it.
+function parseSweepItems(text) {
+    const m = (text || '').match(/\[[\s\S]*\]/);
+    if (!m) return null;
+    let arr;
+    try { arr = JSON.parse(m[0]); } catch (e) { return null; }
+    if (!Array.isArray(arr)) return null;
+    const seen = new Set();
+    const out = [];
+    for (const v of arr) {
+        if (typeof v !== 'string') continue;
+        const t = v.replace(/\s+/g, ' ').trim().replace(/^[-*+]\s+(\[[ xX]\]\s+)?/, '');
+        if (!t) continue;
+        const key = t.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(t);
+    }
+    return out;
+}
+
+// Add items to the end of the note's Inbox section, touching nothing else.
+// A note without an Inbox heading yet is rewritten in the canonical layout
+// (Inbox on top, list under TODO) by the same serializers every save uses.
+function appendToInbox(content, items) {
+    const lines = content.split('\n');
+    let start = -1, end = lines.length;
+    for (let i = 0; i < lines.length; i++) {
+        const h = lines[i].match(/^#{1,6}\s+(.+)$/);
+        if (!h) continue;
+        if (start < 0) { if (classifyHeading(h[1]) === 'inbox') start = i; }
+        else { end = i; break; }
+    }
+    if (start < 0) {
+        const parsed = parseNote(content);
+        if (parsed.mode === 'flat') return serializeFlat(content, parsed.items, [...parsed.inbox, ...items]);
+        return serializeMatrix(content, { ...parsed.sections, inbox: [...parsed.sections.inbox, ...items] });
+    }
+    // Insert after the section's last non-blank line (or right under the
+    // heading when it's empty), so a trailing blank line before the next
+    // heading stays where it was.
+    let at = start + 1;
+    for (let i = start + 1; i < end; i++) if (lines[i].trim() !== '') at = i + 1;
+    const rendered = items.flatMap(renderItemBlock);
+    lines.splice(at, 0, ...rendered);
+    return lines.join('\n');
 }
 
 // System prompt shared by all the periodic reviews; `k` is a REVIEW_KINDS
@@ -2022,12 +2122,16 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         await this.loadSettings();
         this.addSettingTab(new FactotumSettingTab(this.app, this));
         this.beeminderTimer = null;
+        this.sweepTimer = null;
+        this.sweepRunning = false;
         this.reviewTimers = {};
         this.syncSettling = null;
         this.setupScrollOff();
         this.app.workspace.onLayoutReady(() => {
             this.maybeCatchUpBeeminder();
             this.scheduleBeeminderSubmission();
+            this.maybeCatchUpDailySweep();
+            this.scheduleDailySweep();
             for (const kind of Object.keys(REVIEW_KINDS)) {
                 this.maybeCatchUpReview(kind);
                 this.scheduleReview(kind);
@@ -2119,7 +2223,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             id: 'factotum-claude-prioritize',
             name: 'Prioritize with Claude (whole list → Eisenhower matrix)',
             editorCallback: (editor) => {
-                if (!this.settings.anthropic.apiKey) {
+                if (!this.anthropicApiKey()) {
                     new obsidian.Notice('Factotum: set an Anthropic API key in settings first.');
                     return;
                 }
@@ -2131,7 +2235,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                     new obsidian.Notice('Factotum: no items to prioritize.');
                     return;
                 }
-                new ClaudePrioritizeModal(this.app, parsed, this.settings.anthropic, (result) => {
+                new ClaudePrioritizeModal(this.app, parsed, { apiKey: this.anthropicApiKey(), model: this.settings.anthropic.model }, (result) => {
                     applyResult(editor, content, result);
                     new obsidian.Notice('Factotum: Claude\'s prioritization saved ✓');
                 }).open();
@@ -2176,6 +2280,12 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             }
         });
 
+        this.addCommand({
+            id: 'factotum-sweep-daily-note',
+            name: 'Sweep today\'s daily note for to-dos (into the TODO note\'s Inbox)',
+            callback: () => this.runDailySweep('manual sweep', null, true),
+        });
+
         this.registerView(REFLECTION_FEED_VIEW, (leaf) => new ReflectionFeedView(leaf, this));
         this.addRibbonIcon('shuffle', 'Open reflection feed', () => this.openReflectionFeed());
         this.addCommand({
@@ -2189,6 +2299,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
 
     onunload() {
         this.clearBeeminderTimer();
+        this.clearSweepTimer();
         this.clearAllReviewTimers();
         console.log('Factotum unloaded');
     }
@@ -2245,6 +2356,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         this.settings.beeminder = Object.assign({}, DEFAULT_SETTINGS.beeminder, data?.beeminder);
         this.settings.reflectionFeed = Object.assign({}, DEFAULT_SETTINGS.reflectionFeed, data?.reflectionFeed);
         this.settings.anthropic = Object.assign({}, DEFAULT_SETTINGS.anthropic, data?.anthropic);
+        this.settings.dailySweep = Object.assign({}, DEFAULT_SETTINGS.dailySweep, data?.dailySweep);
         this.settings.weeklyReview = Object.assign({}, DEFAULT_SETTINGS.weeklyReview, data?.weeklyReview);
         this.settings.monthlyReview = Object.assign({}, DEFAULT_SETTINGS.monthlyReview, data?.monthlyReview);
         this.settings.quarterlyReview = Object.assign({}, DEFAULT_SETTINGS.quarterlyReview, data?.quarterlyReview);
@@ -2260,10 +2372,62 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         }
         delete this.settings.weeklyReview.apiKey;
         delete this.settings.weeklyReview.model;
+
+        // Move any plaintext secrets into the keychain, then drop them from
+        // data.json. Runs once per device; a later load finds the fields blank.
+        const ss = secretStore(this.app);
+        if (ss) {
+            let moved = false;
+            const move = (obj, field, id) => {
+                if (!obj[field]) return;
+                try {
+                    ss.setSecret(id, obj[field]);
+                    obj[field] = '';
+                    moved = true;
+                } catch (e) {
+                    console.warn('Factotum — could not move a secret into the keychain; leaving it in data.json', e);
+                }
+            };
+            move(this.settings.anthropic, 'apiKey', SECRET_IDS.anthropicApiKey);
+            move(this.settings.beeminder, 'authToken', SECRET_IDS.beeminderAuthToken);
+            if (moved) await this.saveSettings();
+        }
     }
 
     async saveSettings() {
         await this.saveData(this.settings);
+    }
+
+    // Secrets: keychain first, legacy plaintext field as the fallback.
+    anthropicApiKey() {
+        return this.readSecret(SECRET_IDS.anthropicApiKey, this.settings.anthropic.apiKey);
+    }
+
+    beeminderAuthToken() {
+        return this.readSecret(SECRET_IDS.beeminderAuthToken, this.settings.beeminder.authToken);
+    }
+
+    readSecret(id, legacyValue) {
+        const ss = secretStore(this.app);
+        if (ss) {
+            const v = ss.getSecret(id);
+            if (v) return v;
+        }
+        return legacyValue || '';
+    }
+
+    // Store a secret in the keychain when there is one, otherwise in the legacy
+    // plaintext field. An empty value clears it from both places.
+    async storeSecret(id, value, legacyObj, legacyField) {
+        const ss = secretStore(this.app);
+        if (ss) {
+            if (value) ss.setSecret(id, value);
+            else if (typeof ss.deleteSecret === 'function') ss.deleteSecret(id);
+            legacyObj[legacyField] = '';
+        } else {
+            legacyObj[legacyField] = value;
+        }
+        await this.saveSettings();
     }
 
     // Resolve the configured TODO note to a TFile, tolerating a missing ".md".
@@ -2307,19 +2471,28 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         }
     }
 
-    // The next 11PM (today's, before it passes; otherwise still today's instant).
-    nextBeeminderDeadline() {
-        return obsidian.moment().hour(23).minute(0).second(0).millisecond(0);
+    // The nightly jobs (Beeminder submission, daily to-do sweep) run on the
+    // review schedule: a day closes at midnight — the start of the next day —
+    // and the job then processes the day that just ended, so anything written
+    // late in the evening is included. The boundary is always in the future,
+    // at most 24h away, so the delay fits setTimeout's cap.
+    nextDayClose() {
+        return obsidian.moment().startOf('day').add(1, 'day');
     }
 
-    // (Re)arm a timer that fires at the next 11PM, submits, then re-arms itself.
+    // The day that most recently closed: yesterday.
+    lastClosedDay() {
+        return obsidian.moment().startOf('day').subtract(1, 'day');
+    }
+
+    // (Re)arm a timer that fires at midnight, submits the day that just ended,
+    // then re-arms itself.
     scheduleBeeminderSubmission() {
         this.clearBeeminderTimer();
         if (!this.settings.beeminder.enabled) return;
         const now = obsidian.moment();
-        const next = this.nextBeeminderDeadline();
-        if (next.isSameOrBefore(now)) next.add(1, 'day');
-        const deadline = next.clone();
+        const next = this.nextDayClose();
+        const target = next.clone().subtract(1, 'day');
         this.beeminderTimer = window.setTimeout(async () => {
             // Mobile (iOS) suspends timers while the app is backgrounded; on
             // resume a pending setTimeout fires immediately rather than at its
@@ -2327,24 +2500,19 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             // the wall clock, not the firing: only submit once we've actually
             // reached the deadline, and never re-send a day already stamped.
             // Otherwise just re-arm, which recomputes the correct remaining delay.
-            if (obsidian.moment().isSameOrAfter(deadline) &&
-                this.settings.beeminder.lastSubmittedDaystamp !== deadline.format('YYYYMMDD')) {
-                await this.runBeeminderSubmission('scheduled 11PM', deadline);
+            if (obsidian.moment().isSameOrAfter(next) &&
+                this.settings.beeminder.lastSubmittedDaystamp !== target.format('YYYYMMDD')) {
+                await this.runBeeminderSubmission('scheduled day-close 12AM', target);
             }
             this.scheduleBeeminderSubmission();
         }, next.diff(now));
     }
 
-    // If a scheduled 11PM submission was missed (Obsidian closed at the time),
-    // catch up on open by submitting for the most recent 11PM deadline that has
-    // already passed — which is yesterday if it's currently before 11PM today.
+    // If a midnight submission was missed (Obsidian closed at the time), catch
+    // up on open by submitting for the day that most recently closed.
     async maybeCatchUpBeeminder() {
         if (!this.settings.beeminder.enabled) return;
-        const now = obsidian.moment();
-        // Most recent 11PM deadline that has already passed (yesterday's if it's
-        // currently before 11PM today).
-        const mostRecent = this.nextBeeminderDeadline();
-        if (mostRecent.isAfter(now)) mostRecent.subtract(1, 'day');
+        const mostRecent = this.lastClosedDay();
         // Timers are unreliable on mobile and this runs only once per cold start,
         // so a multi-day absence (phone away for a weekend) would otherwise lose
         // every day but the last. Walk back a week and submit each day whose note
@@ -2360,7 +2528,8 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     async runBeeminderSubmission(reason, targetMoment = null, notify = false) {
         const s = this.settings.beeminder;
         if (!s.enabled) return;
-        if (!s.authToken || !s.username || !s.goalName) {
+        const authToken = this.beeminderAuthToken();
+        if (!authToken || !s.username || !s.goalName) {
             if (notify) new obsidian.Notice('Factotum: Beeminder not configured (token, user, and goal required).');
             return;
         }
@@ -2375,7 +2544,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         // because submitToBeeminder() uses a stable per-day requestid, sending 0
         // OVERWRITES a real value another device already submitted for this day —
         // silently destroying the count. Treat an absent note as "data not here
-        // yet": skip without stamping, so a later open or 11PM timer retries once
+        // yet": skip without stamping, so a later open or midnight timer retries once
         // the note arrives. (Mirrors the weekly review's empty-week guard.) A
         // present-but-empty note is genuine 0 and still submits.
         const notePath = dailyNotePath(config, day);
@@ -2392,7 +2561,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const comment = `daily note word count: ${noteWords} − ${templateWords} (template) [${reason}]`;
 
         try {
-            const res = await submitToBeeminder(s, value, daystamp, comment);
+            const res = await submitToBeeminder(s, authToken, value, daystamp, comment);
             if (res.status >= 200 && res.status < 300) {
                 s.lastSubmittedDaystamp = daystamp;
                 await this.saveSettings();
@@ -2407,6 +2576,157 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             if (notify) new obsidian.Notice('Factotum: Beeminder submission failed (network error).');
             console.error('Factotum — Beeminder request failed', e);
         }
+    }
+
+    clearSweepTimer() {
+        if (this.sweepTimer !== null) {
+            window.clearTimeout(this.sweepTimer);
+            this.sweepTimer = null;
+        }
+    }
+
+    // (Re)arm a timer that fires at midnight, sweeps the daily note of the day
+    // that just ended, then re-arms — the Beeminder schedule, with the same
+    // suspended-app guard.
+    scheduleDailySweep() {
+        this.clearSweepTimer();
+        if (!this.settings.dailySweep.enabled) return;
+        const now = obsidian.moment();
+        const next = this.nextDayClose();
+        const target = next.clone().subtract(1, 'day');
+        this.sweepTimer = window.setTimeout(async () => {
+            if (obsidian.moment().isSameOrAfter(next) &&
+                this.settings.dailySweep.lastSweptDaystamp !== target.format('YYYYMMDD')) {
+                await this.runDailySweep('scheduled day-close 12AM', target);
+            }
+            this.scheduleDailySweep();
+        }, next.diff(now));
+    }
+
+    // If a midnight sweep was missed (Obsidian closed, or a phone whose timers
+    // never fired), catch up on open: every day since the last one swept,
+    // up to a week back, oldest first. On first enable only the most recent
+    // night is swept — nothing older gets dragged in. Days whose note is
+    // missing are skipped without a stamp, so a note that syncs in late is
+    // picked up by a later open. Each day is one Claude call, so this waits
+    // for sync to settle first — another device may have swept already, and
+    // the TODO note it wrote to should land before this one writes.
+    async maybeCatchUpDailySweep() {
+        const s = this.settings.dailySweep;
+        if (!s.enabled) return;
+        const mostRecent = this.lastClosedDay();
+        const back = s.lastSweptDaystamp ? 6 : 0;
+        await this.waitForSyncSettled();
+        if (!s.enabled) return;
+        for (let i = back; i >= 0; i--) {
+            const day = mostRecent.clone().subtract(i, 'day');
+            if (day.format('YYYYMMDD') <= s.lastSweptDaystamp) continue;
+            await this.runDailySweep('catch-up on open', day);
+        }
+    }
+
+    // Sweep one day's daily note into the TODO note's Inbox. Scheduled and
+    // catch-up runs pass the day and stamp it afterwards; a manual run (no
+    // day → today) never stamps, so the night's scheduled sweep still picks
+    // up anything written later in the day — Claude sees the TODO note and
+    // skips what the manual run already captured.
+    async runDailySweep(reason, targetMoment = null, notify = false) {
+        if (this.sweepRunning) {
+            if (notify) new obsidian.Notice('Factotum: a sweep is already running.');
+            return;
+        }
+        this.sweepRunning = true;
+        try {
+            await this.doDailySweep(reason, targetMoment, notify);
+        } finally {
+            this.sweepRunning = false;
+        }
+    }
+
+    async doDailySweep(reason, targetMoment, notify) {
+        const s = this.settings.dailySweep;
+        const apiKey = this.anthropicApiKey();
+        if (!apiKey) {
+            if (notify) new obsidian.Notice('Factotum: the daily sweep needs an Anthropic API key.');
+            return;
+        }
+        const todoFile = this.resolveTodoNote();
+        if (!todoFile) {
+            if (notify) new obsidian.Notice('Factotum: set a TODO note path in settings first.');
+            return;
+        }
+        const config = getDailyNoteConfig(this.app);
+        if (!config) {
+            if (notify) new obsidian.Notice('Factotum: could not find a Daily Notes / Periodic Notes config.');
+            return;
+        }
+        const day = targetMoment || obsidian.moment();
+        const daystamp = day.format('YYYYMMDD');
+        const stamp = async () => {
+            if (!targetMoment || daystamp <= s.lastSweptDaystamp) return;
+            s.lastSweptDaystamp = daystamp;
+            await this.saveSettings();
+        };
+        const noteFile = this.app.vault.getAbstractFileByPath(dailyNotePath(config, day));
+        if (!(noteFile instanceof obsidian.TFile)) {
+            if (notify) new obsidian.Notice(`Factotum: no daily note for ${day.format('YYYY-MM-DD')} yet — nothing to sweep.`);
+            return;
+        }
+        const noteText = await this.app.vault.cachedRead(noteFile);
+        // An untouched template has nothing to extract — don't spend a call.
+        const templatePath = resolveTemplatePath(this.settings.beeminder.templatePath || config.template);
+        if (countWords(noteText) - await readWordCount(this.app, templatePath) <= 0) {
+            if (notify) new obsidian.Notice(`Factotum: nothing written in ${day.format('YYYY-MM-DD')}'s note yet — nothing to sweep.`);
+            await stamp();
+            return;
+        }
+
+        const target = this.fileTarget(todoFile);
+        const todoBefore = await target.read();
+        const MAX_TODO_CHARS = 60000;
+        const todoContext = todoBefore.length > MAX_TODO_CHARS
+            ? todoBefore.slice(0, MAX_TODO_CHARS) + '\n…(truncated)'
+            : todoBefore;
+        const user =
+            `Daily note for ${day.format('YYYY-MM-DD')}:\n\n${stripFrontmatter(noteText)}\n\n---\n\n` +
+            `Current TODO note (skip anything already captured here, in any wording):\n\n${todoContext}`;
+
+        let res;
+        try {
+            res = await callClaude(apiKey, this.settings.anthropic.model, SWEEP_SYSTEM, user);
+        } catch (e) {
+            if (notify) new obsidian.Notice('Factotum: the sweep could not reach Claude (network error).');
+            console.error('Factotum — daily sweep request failed', e);
+            return;
+        }
+        if (!res.ok) {
+            if (notify) new obsidian.Notice(`Factotum: Claude API error during the sweep (HTTP ${res.status}).`);
+            console.error('Factotum — daily sweep API error', res.status);
+            return;
+        }
+        const found = parseSweepItems(res.text);
+        if (!found) {
+            if (notify) new obsidian.Notice('Factotum: Claude\'s sweep response couldn\'t be parsed.');
+            console.error('Factotum — unparseable sweep response', res.text);
+            return;
+        }
+
+        // The call takes a while; re-read so an edit made meanwhile isn't
+        // clobbered, and drop anything now literally present in the note.
+        const todoNow = await target.read();
+        const haystack = todoNow.toLowerCase();
+        const fresh = found.filter(t => !haystack.includes(t.toLowerCase()));
+        if (fresh.length === 0) {
+            if (notify) new obsidian.Notice(`Factotum: no new to-dos in ${day.format('YYYY-MM-DD')}'s note.`);
+            await stamp();
+            return;
+        }
+        const link = s.linkSource ? ` ([[${this.app.metadataCache.fileToLinktext(noteFile, todoFile.path)}]])` : '';
+        const items = fresh.map(t => ({ text: t + link, isTask: true, children: [] }));
+        await target.write(appendToInbox(todoNow, items));
+        await stamp();
+        console.log(`Factotum — swept ${fresh.length} to-do(s) from ${noteFile.path} into ${todoFile.path} [${reason}]`);
+        if (notify) new obsidian.Notice(`Factotum: added ${fresh.length} to-do${fresh.length === 1 ? '' : 's'} to the Inbox ✓`);
     }
 
     clearReviewTimer(kind) {
@@ -2663,7 +2983,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             await this.waitForSyncSettled();
             if (!s.enabled) return; // may have been toggled off during the wait
         }
-        if (!this.settings.anthropic.apiKey) {
+        if (!this.anthropicApiKey()) {
             if (notify) new obsidian.Notice(`Factotum: the ${k.adjLabel} review needs an Anthropic API key.`);
             return;
         }
@@ -2719,7 +3039,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         new obsidian.Notice(`Factotum: generating ${k.adjLabel} review for ${stamp}…`);
         let result;
         try {
-            result = await callClaude(this.settings.anthropic.apiKey, this.settings.anthropic.model, reviewSystem(k, sourceLabel, !!goalsText), userContent);
+            result = await callClaude(this.anthropicApiKey(), this.settings.anthropic.model, reviewSystem(k, sourceLabel, !!goalsText), userContent);
         } catch (e) {
             new obsidian.Notice(`Factotum: ${k.adjLabel} review request failed (network error).`);
             console.error('Factotum — Claude request failed', e);
@@ -2905,13 +3225,13 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
             .setHeading();
 
         containerEl.createEl('p', {
-            text: 'At 11PM each night, send the word count of today\'s daily note (minus the daily note template\'s word count) to a Beeminder goal.',
+            text: 'At midnight each night, send the word count of the day that just ended\'s daily note (minus the daily note template\'s word count) to a Beeminder goal.',
             cls: 'ordinal-hint',
         });
 
         new obsidian.Setting(containerEl)
             .setName('Enable nightly submission')
-            .setDesc('Send the count automatically at 11PM, and catch up on startup if the app was closed at 11PM.')
+            .setDesc('Send the count automatically at midnight, and catch up on startup if the app was closed at midnight.')
             .addToggle(t => t
                 .setValue(b.enabled)
                 .onChange(async (v) => {
@@ -2922,11 +3242,10 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
 
         new obsidian.Setting(containerEl)
             .setName('Beeminder auth token')
-            .setDesc('From beeminder.com/api/v1/auth_token.json (or your account settings).')
+            .setDesc(`From beeminder.com/api/v1/auth_token.json (or your account settings). ${secretHomeDesc(this.app)}`)
             .addText(t => {
-                t.setPlaceholder('auth token')
-                    .setValue(b.authToken)
-                    .onChange(async (v) => { b.authToken = v.trim(); await this.plugin.saveSettings(); });
+                t.setPlaceholder(this.plugin.beeminderAuthToken() ? '•••••••• (saved; paste to replace)' : 'auth token')
+                    .onChange(async (v) => { await this.plugin.storeSecret(SECRET_IDS.beeminderAuthToken, v.trim(), b, 'authToken'); });
                 t.inputEl.type = 'password';
             });
 
@@ -2967,17 +3286,16 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
             .setHeading();
 
         containerEl.createEl('p', {
-            text: 'The "Prioritize with Claude" command and the periodic reviews below (weekly, monthly, quarterly, yearly, decade, century) use Claude via the Anthropic API (a few cents per run) and share this API key and model.',
+            text: 'The "Prioritize with Claude" command, the daily to-do sweep, and the periodic reviews below (weekly, monthly, quarterly, yearly, decade, century) use Claude via the Anthropic API (a few cents per run) and share this API key and model.',
             cls: 'ordinal-hint',
         });
 
         new obsidian.Setting(containerEl)
             .setName('Anthropic API key')
-            .setDesc('From console.anthropic.com. Stored locally in this plugin\'s data.json.')
+            .setDesc(`From console.anthropic.com. ${secretHomeDesc(this.app)}`)
             .addText(t => {
-                t.setPlaceholder('sk-ant-...')
-                    .setValue(a.apiKey)
-                    .onChange(async (v) => { a.apiKey = v.trim(); await this.plugin.saveSettings(); });
+                t.setPlaceholder(this.plugin.anthropicApiKey() ? '•••••••• (saved; paste to replace)' : 'sk-ant-...')
+                    .onChange(async (v) => { await this.plugin.storeSecret(SECRET_IDS.anthropicApiKey, v.trim(), a, 'apiKey'); });
                 t.inputEl.type = 'password';
             });
 
@@ -2988,6 +3306,42 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
                 .setPlaceholder('claude-opus-4-8')
                 .setValue(a.model)
                 .onChange(async (v) => { a.model = v.trim(); await this.plugin.saveSettings(); }));
+
+        const ds = this.plugin.settings.dailySweep;
+
+        new obsidian.Setting(containerEl)
+            .setName('Daily to-do sweep')
+            .setHeading();
+
+        containerEl.createEl('p', {
+            text: 'At midnight each night, read the daily note of the day that just ended, have Claude pull out the to-dos written into it (prose like "I need to remember to…" counts, not just checkboxes), and add them under the Inbox heading of the TODO note above for triage. Items already in the TODO note are skipped. Each item links back to the daily note it came from.',
+            cls: 'ordinal-hint',
+        });
+
+        new obsidian.Setting(containerEl)
+            .setName('Enable nightly sweep')
+            .setDesc('Sweep automatically at midnight, and catch up on startup for nights the app was closed (up to a week back). Needs the TODO note path and the API key above.')
+            .addToggle(t => t
+                .setValue(ds.enabled)
+                .onChange(async (v) => {
+                    ds.enabled = v;
+                    await this.plugin.saveSettings();
+                    this.plugin.scheduleDailySweep();
+                }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Link each item to its daily note')
+            .setDesc('Append a wiki link like ([[2026-09-12]]) so an Inbox item can be traced back to the day it was written.')
+            .addToggle(t => t
+                .setValue(ds.linkSource)
+                .onChange(async (v) => { ds.linkSource = v; await this.plugin.saveSettings(); }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Sweep today\'s note now')
+            .setDesc('Run immediately on today\'s note to test your configuration. A manual sweep doesn\'t count as the night\'s sweep, so the midnight run still happens.')
+            .addButton(btn => btn
+                .setButtonText('Sweep now')
+                .onClick(() => this.plugin.runDailySweep('manual sweep', null, true)));
 
         // One settings section per review period, all driven by REVIEW_KINDS.
         const reviewUi = {

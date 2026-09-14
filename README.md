@@ -53,7 +53,7 @@ By default this works on the note you're currently viewing. To always add to one
 
 ### Inbox: capture now, prioritize later
 
-Add an `## Inbox` heading to your TODO note and toss unprioritized bullets under it as they occur to you. The Inbox lives at the **top** of the note, with a `## TODO` heading below it marking where the ranked list starts — the plugin adds the TODO heading (and keeps both sections in place) whenever it saves. Inbox items are ignored by ranking sessions — they hold no rank until you triage them. When you're ready:
+Add an `## Inbox` heading to your TODO note and toss unprioritized bullets under it as they occur to you (the [nightly sweep](#nightly-to-do-sweep--inbox) can fill it from your daily notes too). The Inbox lives at the **top** of the note, with a `## TODO` heading below it marking where the ranked list starts — the plugin adds the TODO heading (and keeps both sections in place) whenever it saves. Inbox items are ignored by ranking sessions — they hold no rank until you triage them. When you're ready:
 
 > **Factotum: Triage inbox (prioritize and place each item)**
 
@@ -130,7 +130,7 @@ Set the number of lines in **Settings → Factotum → Editing → Scroll offset
 
 ### Nightly word count → Beeminder
 
-Optionally, the plugin can post your daily writing output to a [Beeminder](https://www.beeminder.com) goal every night at **11PM**.
+Optionally, the plugin can post your daily writing output to a [Beeminder](https://www.beeminder.com) goal every night at **midnight**, as the day closes — like the periodic reviews, it processes the day that just ended, so late-evening writing counts.
 
 Enable it in **Settings → Factotum** and fill in:
 
@@ -139,7 +139,19 @@ Enable it in **Settings → Factotum** and fill in:
 
 Each night it counts the words in today's daily note, **subtracts the word count of your daily note template** (so boilerplate doesn't inflate the number), and sends the result. The daily note and template are located automatically from your **Daily Notes** or **Periodic Notes** settings; you can override the template path in settings if needed.
 
-If Obsidian wasn't open at 11PM, it catches up the next time you launch (provided it's still past 11PM and that day hasn't been sent yet). Re-sends for the same day update the datapoint rather than duplicating it. Use **Send now** in settings to test your setup.
+If Obsidian wasn't open at midnight, it catches up the next time you launch, walking back up to a week for days with a note. Re-sends for the same day update the datapoint rather than duplicating it. Use **Send now** in settings to test your setup.
+
+### Nightly to-do sweep → Inbox
+
+Optionally, the plugin can sweep each day's daily note for the to-dos you wrote into it and drop them under the **`## Inbox`** heading of your TODO note, ready for the next triage. It runs every night at **midnight** on the day that just ended — the same day-close timing as the Beeminder submission and the periodic reviews, so late-evening writing is included — and catches up on the next launch for nights the app was closed (up to a week back, oldest first).
+
+The sweep uses Claude, so it finds to-dos written as prose — *"I need to remember to ask Lauren what I'm authorized to spend"*, *"gotta get an air pump before I can ride the ebike"* — not just checkboxes. Each is rewritten as a short imperative that stands on its own (`- [ ] Buy an air pump for the ebike tires ([[2026-09-12]])`), with a link back to the day it came from. Routine daily intentions (exercise, write, shave), musings, and anything the note shows was already done are left alone, and the whole TODO note is sent along as context so items already captured — in the Inbox, the ranked list, or Done — aren't added twice. A day whose note is still the untouched template costs no API call.
+
+Enable it in **Settings → Factotum → Daily to-do sweep**. It needs the **TODO note path** (top of the settings) and the shared **Anthropic API key**. The daily note is located from your **Daily Notes** or **Periodic Notes** settings, and the template is subtracted the same way the word count does it. **Sweep now** in settings, or the command palette entry
+
+> **Factotum: Sweep today's daily note for to-dos (into the TODO note's Inbox)**
+
+runs it on demand — handy on a phone, where background timers don't fire. A manual sweep works on today's note and doesn't count as the night's sweep, so the midnight run still happens and picks up anything written later; what the manual run already captured is skipped. The link suffix can be turned off in settings.
 
 ### Periodic review notes (weekly, monthly, quarterly, yearly, decade, century)
 
@@ -163,7 +175,7 @@ Notes are named by period — `2026-W23.md`, `2026-06.md`, `2026-Q2.md`, `2026.m
 
 The longer spans handle the model's context window gracefully: when a period's daily notes would exceed the input budget (~150k tokens, estimated at 4 characters per token), the **yearly**, **decade**, and **century** reviews keep as many recent daily notes as fit and consolidate the older remainder into the plugin's own previously generated review notes, coarser the farther back they reach — the oldest weeks become their weekly reviews, then monthly, quarterly, yearly (and, for the century, decade reviews) — read from those reviews' configured folders. A year that runs slightly over might send nine recent months day by day plus a dozen weekly reviews for the spring; a decade reads as yearly reviews at the far end tapering to daily notes at the near end. A consolidated period whose review note doesn't exist drops out of the input, and the note's frontmatter records the mix used (`source: weekly reviews and daily notes`). Weekly, monthly, and quarterly reviews always read daily notes directly.
 
-> Each run makes one Claude API call (typically a few cents; the longer reviews send more input, so they cost more — up to the ~150k-token input budget). The API key is stored locally in the plugin's `data.json`.
+> Each run makes one Claude API call (typically a few cents; the longer reviews send more input, so they cost more — up to the ~150k-token input budget). The API key and the Beeminder token are kept in Obsidian's keychain (encrypted with the OS keyring, per device, outside the vault) on Obsidian 1.11.4+; older builds fall back to the plugin's `data.json`. Any key found in `data.json` is moved into the keychain on the next load.
 
 ---
 
