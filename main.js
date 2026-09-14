@@ -743,7 +743,7 @@ class AddItemModal extends obsidian.Modal {
             });
         } else {
             contentEl.createEl('p', {
-                text: 'After naming, you\'ll classify it into an Eisenhower quadrant (urgent? important?) — it lands at the end of that quadrant.',
+                text: 'After naming, you\'ll classify it into an Eisenhower quadrant (urgent? important?) — it lands at the top of that quadrant.',
                 cls: 'ordinal-hint'
             });
         }
@@ -811,11 +811,11 @@ class AddItemModal extends obsidian.Modal {
 
     startMatrix(important) {
         // No within-quadrant comparisons in a matrix — the quadrant is the
-        // rank, so the item simply lands at the end of its quadrant.
+        // rank, so the item simply lands at the top of its quadrant (newest first).
         const q = findQuadrant(this.urgent, important);
         this.targetQuadrant = q;
         this.sorted = [...this.payload.sections[q.key]];
-        this.finish(this.sorted.length);
+        this.finish(0);
     }
 
     renderCompare() {
@@ -1021,10 +1021,11 @@ class TriageInboxModal extends obsidian.Modal {
 
     classify(important) {
         // No within-quadrant comparisons in a matrix — the item lands at the
-        // end of its quadrant.
+        // top of its quadrant. Inbox items are walked oldest-first, so each
+        // one prepending leaves the quadrant reading newest-first.
         this.targetQuadrant = findQuadrant(this.urgent, important);
         this.list = this.sections[this.targetQuadrant.key];
-        this.place(this.list.length);
+        this.place(0);
     }
 
     // Binary-search the current item into `list` (mutated in place), so later

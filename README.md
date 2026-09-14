@@ -47,7 +47,7 @@ On a **matrix note**, the quadrant *is* the rank — there are no within-quadran
 
 > **Factotum: Add new item to the note**
 
-Type your new item, then answer ~log₂(n) comparisons to slot it in the right place. For a 100-item list that's ~7 questions. In a matrix note it's just the two classification questions (urgent? important?) — the item lands at the end of its quadrant, no comparisons.
+Type your new item, then answer ~log₂(n) comparisons to slot it in the right place. For a 100-item list that's ~7 questions. In a matrix note it's just the two classification questions (urgent? important?) — the item lands at the top of its quadrant, no comparisons.
 
 By default this works on the note you're currently viewing. To always add to one designated TODO note no matter which note is open, set a **TODO note path** in **Settings → Factotum** (e.g. `TODO.md`). The command then targets that note from anywhere — and stays available even when no note is open. Leave the path blank to keep the original "current note" behavior.
 
@@ -63,7 +63,7 @@ Add an `## Inbox` heading to your TODO note and toss unprioritized bullets under
 
 > **Factotum: Triage inbox (prioritize and place each item)**
 
-Each inbox item is walked through the usual flow — in a matrix note you classify it (urgent? important?) and it lands at the end of that quadrant; in a flat note it's binary-search-placed into the ranked list. On save, every item lands in its spot and the Inbox is emptied (the heading stays, ready for the next capture).
+Each inbox item is walked through the usual flow — in a matrix note you classify it (urgent? important?) and it lands at the top of that quadrant, so newer items read first; in a flat note it's binary-search-placed into the ranked list. On save, every item lands in its spot and the Inbox is emptied (the heading stays, ready for the next capture).
 
 ### Stopping partway — progress is saved
 
