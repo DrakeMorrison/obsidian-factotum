@@ -2237,25 +2237,30 @@ class ReflectionFeedView extends obsidian.ItemView {
     }
 }
 
+// How often the wall clock is checked against each job's period boundary,
+// and the retry backoff for a run that ended without stamping its period.
+const SCHEDULE_TICK_MS = 60 * 1000;
+const RETRY_MIN_MS = 5 * 60 * 1000;
+const RETRY_MAX_MS = 60 * 60 * 1000;
+
 class DrakeFactotumPlugin extends obsidian.Plugin {
     async onload() {
         await this.loadSettings();
         this.addSettingTab(new FactotumSettingTab(this.app, this));
-        this.beeminderTimer = null;
-        this.sweepTimer = null;
         this.sweepRunning = false;
-        this.reviewTimers = {};
         this.syncSettling = null;
+        this.jobRunning = {};   // job id → true while its run is in flight
+        this.jobRetryAt = {};   // job id → wall-clock ms before which a failed run isn't retried
+        this.jobRetryMs = {};   // job id → current backoff, 0 once the period is stamped
         this.setupScrollOff();
         this.app.workspace.onLayoutReady(() => {
-            this.maybeCatchUpBeeminder();
-            this.scheduleBeeminderSubmission();
-            this.maybeCatchUpDailySweep();
-            this.scheduleDailySweep();
-            for (const kind of Object.keys(REVIEW_KINDS)) {
-                this.maybeCatchUpReview(kind);
-                this.scheduleReview(kind);
+            // Catch up on whatever closed while the app was shut (the nightly
+            // jobs walk back up to a week), then keep every boundary under a
+            // once-a-minute wall-clock watch — see tickSchedules().
+            for (const job of this.scheduledJobs()) {
+                if (job.enabled) this.runJob(job, 'catch-up on open', () => job.catchUp());
             }
+            this.registerInterval(window.setInterval(() => this.tickSchedules(), SCHEDULE_TICK_MS));
         });
 
         this.addCommand({
@@ -2442,9 +2447,6 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     }
 
     onunload() {
-        this.clearBeeminderTimer();
-        this.clearSweepTimer();
-        this.clearAllReviewTimers();
         console.log('Factotum unloaded');
     }
 
@@ -2608,48 +2610,107 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         };
     }
 
-    clearBeeminderTimer() {
-        if (this.beeminderTimer !== null) {
-            window.clearTimeout(this.beeminderTimer);
-            this.beeminderTimer = null;
-        }
-    }
-
-    // The nightly jobs (Beeminder submission, daily to-do sweep) run on the
-    // review schedule: a day closes at midnight — the start of the next day —
-    // and the job then processes the day that just ended, so anything written
-    // late in the evening is included. The boundary is always in the future,
-    // at most 24h away, so the delay fits setTimeout's cap.
-    nextDayClose() {
-        return obsidian.moment().startOf('day').add(1, 'day');
-    }
+    // ── Scheduling ─────────────────────────────────────────────────────────
+    //
+    // The nightly jobs (Beeminder submission, daily to-do sweep) and the
+    // periodic reviews all run when a period closes: midnight — the start of
+    // the next day — for the nightly jobs, and the first midnight of the next
+    // week/month/quarter/year for the reviews. Running at the boundary means
+    // the period that just ended is processed, so anything written late on
+    // its last day is included.
+    //
+    // A single setTimeout aimed at the boundary is not dependable. Chromium's
+    // timers count on a monotonic clock that stops while the machine is
+    // suspended, so a laptop that sleeps for an hour fires the timer an hour
+    // late; iOS suspends timers in the background and fires them all on
+    // resume; and a run that failed (the machine slept mid-request, Wi-Fi not
+    // yet back after a wake) was previously not retried until the next launch.
+    // Instead a once-a-minute tick compares the wall clock to each job's
+    // boundary and runs whatever has closed and is not yet stamped — the same
+    // test the catch-up on open makes — so a sleep or a lost request only
+    // delays the run to a later tick. A run that ends without stamping its
+    // period (network error, API error, no notes yet) is retried with
+    // backoff rather than every minute.
 
     // The day that most recently closed: yesterday.
     lastClosedDay() {
         return obsidian.moment().startOf('day').subtract(1, 'day');
     }
 
-    // (Re)arm a timer that fires at midnight, submits the day that just ended,
-    // then re-arms itself.
-    scheduleBeeminderSubmission() {
-        this.clearBeeminderTimer();
-        if (!this.settings.beeminder.enabled) return;
-        const now = obsidian.moment();
-        const next = this.nextDayClose();
-        const target = next.clone().subtract(1, 'day');
-        this.beeminderTimer = window.setTimeout(async () => {
-            // Mobile (iOS) suspends timers while the app is backgrounded; on
-            // resume a pending setTimeout fires immediately rather than at its
-            // intended instant, so it can go off long before the deadline. Trust
-            // the wall clock, not the firing: only submit once we've actually
-            // reached the deadline, and never re-send a day already stamped.
-            // Otherwise just re-arm, which recomputes the correct remaining delay.
-            if (obsidian.moment().isSameOrAfter(next) &&
-                this.settings.beeminder.lastSubmittedDaystamp !== target.format('YYYYMMDD')) {
-                await this.runBeeminderSubmission('scheduled day-close 12AM', target);
-            }
-            this.scheduleBeeminderSubmission();
-        }, next.diff(now));
+    // The last day of the review period that most recently closed: the day
+    // before the current period began.
+    lastClosedReviewTarget(kind) {
+        return periodStart(REVIEW_KINDS[kind], obsidian.moment()).subtract(1, 'day');
+    }
+
+    // Every automatic job, with the period it is currently responsible for:
+    // `target` is the last day of the period that most recently closed (what
+    // the run functions expect), `done` whether that period is already
+    // stamped, `run` the scheduled run for it, and `catchUp` the wider
+    // walk-back used once on open.
+    scheduledJobs() {
+        const day = this.lastClosedDay();
+        const daystamp = day.format('YYYYMMDD');
+        const jobs = [
+            { id: 'beeminder', period: 'day', target: day,
+              enabled: this.settings.beeminder.enabled,
+              done: this.settings.beeminder.lastSubmittedDaystamp === daystamp,
+              run: (t, reason) => this.runBeeminderSubmission(reason, t),
+              catchUp: () => this.maybeCatchUpBeeminder() },
+            { id: 'sweep', period: 'day', target: day,
+              enabled: this.settings.dailySweep.enabled,
+              done: this.settings.dailySweep.lastSweptDaystamp >= daystamp,
+              run: (t, reason) => this.runDailySweep(reason, t),
+              catchUp: () => this.maybeCatchUpDailySweep() },
+        ];
+        for (const kind of Object.keys(REVIEW_KINDS)) {
+            const k = REVIEW_KINDS[kind];
+            const target = this.lastClosedReviewTarget(kind);
+            jobs.push({ id: `review:${kind}`, period: kind, target,
+                        enabled: this.settings[k.settingsKey].enabled,
+                        done: this.settings[k.settingsKey][k.stampField] === periodStampOf(k, target),
+                        run: (t, reason) => this.generateReview(kind, reason, t),
+                        catchUp: () => this.maybeCatchUpReview(kind) });
+        }
+        return jobs;
+    }
+
+    // Start every enabled job whose period has closed and is not yet stamped,
+    // unless it is already running or backing off after a failed attempt.
+    // Called once a minute, and when a job is toggled on in settings.
+    tickSchedules() {
+        const now = Date.now();
+        for (const job of this.scheduledJobs()) {
+            if (!job.enabled || this.jobRunning[job.id]) continue;
+            if (job.done) { this.jobRetryMs[job.id] = 0; continue; }
+            if ((this.jobRetryAt[job.id] || 0) > now) continue;
+            this.runJob(job, `scheduled ${job.period}-close 12AM`, (reason) => job.run(job.target, reason));
+        }
+    }
+
+    // Run one job exclusively, then decide whether it needs another go: if
+    // its period is still not stamped afterwards, back off (5 minutes,
+    // doubling to an hour) before the tick tries again. Errors are logged,
+    // never thrown — a failing job must not take the tick down with it.
+    async runJob(job, reason, fn) {
+        if (this.jobRunning[job.id]) return;
+        this.jobRunning[job.id] = true;
+        try {
+            await fn(reason);
+        } catch (e) {
+            console.error(`Factotum — ${job.id} failed [${reason}]`, e);
+        } finally {
+            this.jobRunning[job.id] = false;
+        }
+        const after = this.scheduledJobs().find(j => j.id === job.id);
+        if (!after.enabled || after.done) {
+            this.jobRetryMs[job.id] = 0;
+            return;
+        }
+        const wait = Math.min(Math.max(this.jobRetryMs[job.id] * 2 || 0, RETRY_MIN_MS), RETRY_MAX_MS);
+        this.jobRetryMs[job.id] = wait;
+        this.jobRetryAt[job.id] = Date.now() + wait;
+        console.log(`Factotum — ${job.id} did not complete [${reason}]; retrying in ${Math.round(wait / 60000)} min`);
     }
 
     // If a midnight submission was missed (Obsidian closed at the time), catch
@@ -2720,31 +2781,6 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             if (notify) new obsidian.Notice('Factotum: Beeminder submission failed (network error).');
             console.error('Factotum — Beeminder request failed', e);
         }
-    }
-
-    clearSweepTimer() {
-        if (this.sweepTimer !== null) {
-            window.clearTimeout(this.sweepTimer);
-            this.sweepTimer = null;
-        }
-    }
-
-    // (Re)arm a timer that fires at midnight, sweeps the daily note of the day
-    // that just ended, then re-arms — the Beeminder schedule, with the same
-    // suspended-app guard.
-    scheduleDailySweep() {
-        this.clearSweepTimer();
-        if (!this.settings.dailySweep.enabled) return;
-        const now = obsidian.moment();
-        const next = this.nextDayClose();
-        const target = next.clone().subtract(1, 'day');
-        this.sweepTimer = window.setTimeout(async () => {
-            if (obsidian.moment().isSameOrAfter(next) &&
-                this.settings.dailySweep.lastSweptDaystamp !== target.format('YYYYMMDD')) {
-                await this.runDailySweep('scheduled day-close 12AM', target);
-            }
-            this.scheduleDailySweep();
-        }, next.diff(now));
     }
 
     // If a midnight sweep was missed (Obsidian closed, or a phone whose timers
@@ -2873,17 +2909,6 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         if (notify) new obsidian.Notice(`Factotum: added ${fresh.length} to-do${fresh.length === 1 ? '' : 's'} to the Inbox ✓`);
     }
 
-    clearReviewTimer(kind) {
-        if (this.reviewTimers[kind] != null) {
-            window.clearTimeout(this.reviewTimers[kind]);
-            this.reviewTimers[kind] = null;
-        }
-    }
-
-    clearAllReviewTimers() {
-        for (const kind of Object.keys(REVIEW_KINDS)) this.clearReviewTimer(kind);
-    }
-
     // A review generated on another device may still be syncing down when this
     // device opens (or wakes and fires its pending timers), and generating
     // before it lands writes a duplicate. Resolves once the vault looks
@@ -2933,47 +2958,6 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         return this.syncSettling;
     }
 
-    // The instant the current period closes: the first day of the next one at
-    // 00:00 (Monday for weeks; the 1st for months, quarters, and years).
-    // Reviewing at the start of the new period captures everything written late
-    // on its last day.
-    nextReviewDeadline(kind) {
-        const k = REVIEW_KINDS[kind];
-        return addPeriods(k, periodStart(k, obsidian.moment()), 1);
-    }
-
-    // (Re)arm a timer toward the period-close boundary, review the period that
-    // just ended, then re-arm. The delay to a month/quarter/year boundary can
-    // exceed setTimeout's 32-bit millisecond cap (~24.8 days) — an overflowed
-    // timeout fires immediately — so wake at most every 24 hours and re-arm
-    // until the boundary is actually reached; the wall-clock guard below makes
-    // early wakes harmless.
-    scheduleReview(kind) {
-        this.clearReviewTimer(kind);
-        const k = REVIEW_KINDS[kind];
-        if (!this.settings[k.settingsKey].enabled) return;
-        const now = obsidian.moment();
-        let next = this.nextReviewDeadline(kind);
-        if (next.isSameOrBefore(now)) next = addPeriods(k, next, 1);
-        // The period to review is the one that just closed; its last day is the
-        // day before the boundary. Capture it so a late-firing timer (e.g.
-        // after a sleep/wake) still reviews that period rather than rolling
-        // forward into the new one.
-        const target = next.clone().subtract(1, 'day');
-        const delay = Math.min(next.diff(now), 24 * 60 * 60 * 1000);
-        this.reviewTimers[kind] = window.setTimeout(async () => {
-            // As with the Beeminder timer: a suspended mobile app fires pending
-            // timeouts on resume, before their instant. Only review once the
-            // period has actually closed, and never re-review one already
-            // stamped. Otherwise just re-arm with the recomputed delay.
-            if (obsidian.moment().isSameOrAfter(next) &&
-                this.settings[k.settingsKey][k.stampField] !== periodStampOf(k, target)) {
-                await this.generateReview(kind, `scheduled ${kind}-close 12AM`, target);
-            }
-            this.scheduleReview(kind);
-        }, delay);
-    }
-
     // If a period-close run was missed (Obsidian closed at the boundary), catch
     // up on open by generating for the most recent period that already closed.
     // For long spans this reaches far back: enabling the decade review in 2026
@@ -2983,11 +2967,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     async maybeCatchUpReview(kind) {
         const k = REVIEW_KINDS[kind];
         if (!this.settings[k.settingsKey].enabled) return;
-        const now = obsidian.moment();
-        let deadline = this.nextReviewDeadline(kind);
-        if (deadline.isAfter(now)) deadline = addPeriods(k, deadline, -1);
-        // The just-closed period's last day is the day before that boundary.
-        const target = deadline.clone().subtract(1, 'day');
+        const target = this.lastClosedReviewTarget(kind);
         if (this.settings[k.settingsKey][k.stampField] !== periodStampOf(k, target)) {
             await this.generateReview(kind, 'catch-up on open', target);
         }
@@ -3381,7 +3361,7 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
                 .onChange(async (v) => {
                     b.enabled = v;
                     await this.plugin.saveSettings();
-                    this.plugin.scheduleBeeminderSubmission();
+                    this.plugin.tickSchedules();
                 }));
 
         new obsidian.Setting(containerEl)
@@ -3470,7 +3450,7 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
                 .onChange(async (v) => {
                     ds.enabled = v;
                     await this.plugin.saveSettings();
-                    this.plugin.scheduleDailySweep();
+                    this.plugin.tickSchedules();
                 }));
 
         new obsidian.Setting(containerEl)
@@ -3520,7 +3500,7 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
                     .onChange(async (v) => {
                         s.enabled = v;
                         await this.plugin.saveSettings();
-                        this.plugin.scheduleReview(kind);
+                        this.plugin.tickSchedules();
                     }));
 
             new obsidian.Setting(containerEl)
