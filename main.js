@@ -19,10 +19,12 @@ function classifyHeading(text) {
     if (/^inbox\b/.test(t)) return 'inbox';
     if (/^todo\b/.test(t)) return 'todo';
     if (/^done\b/.test(t)) return 'done';
-    if (/^do\b/.test(t))       return 'Q1';
-    if (/^schedule\b/.test(t)) return 'Q2';
-    if (/^delegate\b/.test(t)) return 'Q3';
-    if (/^delete\b/.test(t))   return 'Q4';
+    // A quadrant heading is the bare word, or the word set off from a
+    // description ("Do — Urgent & Important", "Schedule: someday"). A
+    // heading that merely starts with one ("Do later", "Delete old photos")
+    // is the user's own.
+    const q = t.match(/^(do|schedule|delegate|delete)(?:\s*[^\s\p{L}\p{N}].*)?$/u);
+    if (q) return { do: 'Q1', schedule: 'Q2', delegate: 'Q3', delete: 'Q4' }[q[1]];
     return null;
 }
 
@@ -38,11 +40,18 @@ function findQuadrant(urgent, important) {
 // #urgent / #important tags when it migrates to Done — the metadata survives
 // the move and later doubles as calibration when Claude prioritizes the list.
 function withDoneTags(text, quadrant) {
-    let out = text;
-    if (quadrant.urgent && !/(^|\s)#urgent\b/.test(out)) out += ' #urgent';
-    if (quadrant.important && !/(^|\s)#important\b/.test(out)) out += ' #important';
-    if (!quadrant.urgent && !quadrant.important && !/(^|\s)#(urgent|important|neither)\b/.test(out)) out += ' #neither';
-    return out;
+    let tags = '';
+    if (quadrant.urgent && !/(^|\s)#urgent\b/.test(text)) tags += ' #urgent';
+    if (quadrant.important && !/(^|\s)#important\b/.test(text)) tags += ' #important';
+    if (!quadrant.urgent && !quadrant.important && !/(^|\s)#(urgent|important|neither)\b/.test(text)) tags += ' #neither';
+    return appendTags(text, tags).trim();
+}
+
+// Tags go before a trailing block ID (`^abc123`), which Obsidian only
+// recognizes at the very end of the line.
+function appendTags(text, tags) {
+    const m = text.match(/^(.*?)(\s+\^[A-Za-z0-9-]+)$/);
+    return m ? `${m[1]}${tags}${m[2]}` : `${text}${tags}`;
 }
 
 // ── Markdown parsing / serialization ────────────────────────────────────────
@@ -52,6 +61,8 @@ function withDoneTags(text, quadrant) {
 // column-0-only match misses every item. A line belongs to an item's nested
 // block only when indented past the item's own bullet; tabs count four wide.
 const BULLET_RE = /^( {0,3})[-*+] (.+)$/;
+const HEADING_RE = /^#{1,6}\s+(.+)$/;
+const FENCE_RE = /^\s*(`{3,}|~{3,})/;
 
 function indentWidth(line) {
     let w = 0;
@@ -67,101 +78,145 @@ function isNestedLine(line, bulletIndent) {
     return /^\s+\S/.test(line) && indentWidth(line) > bulletIndent;
 }
 
-function parseNote(content) {
-    const lines = content.split('\n');
-
-    // Detect matrix mode: any heading line that classifies as a quadrant.
-    // Inbox, TODO, and Done headings don't make a note a matrix — a flat
-    // ranked list has those sections too.
-    let matrixMode = false;
-    for (const line of lines) {
-        const m = line.match(/^#{1,6}\s+(.+)$/);
-        const cls = m ? classifyHeading(m[1]) : null;
-        if (cls !== null && QUADRANTS.some(q => q.key === cls)) { matrixMode = true; break; }
+// Index of the line after the code fence opening at `i` (the end of the note
+// when it is never closed).
+function fenceEnd(lines, i) {
+    const open = lines[i].match(FENCE_RE)[1];
+    const close = new RegExp(`^\\s*${open[0]}{${open.length},}\\s*$`);
+    for (let j = i + 1; j < lines.length; j++) {
+        if (close.test(lines[j])) return j + 1;
     }
+    return lines.length;
+}
+
+// Index of the line after an item's nested block: the deeper-indented lines
+// below the bullet at `indent` (nested bullets, sub-tasks, continuation
+// text, fenced code). Blank lines belong to the block only when more of it
+// follows them, as in a loose list.
+function itemEnd(lines, start, indent) {
+    let end = start;
+    let j = start;
+    while (j < lines.length) {
+        if (lines[j].trim() === '') { j++; continue; }
+        if (!isNestedLine(lines[j], indent)) break;
+        j = FENCE_RE.test(lines[j]) ? fenceEnd(lines, j) : j + 1;
+        end = j;
+    }
+    return end;
+}
+
+// The note as a sequence of blocks, which is what every parser and
+// serializer below works from, so they agree on what is a list item and
+// what is not:
+//   heading — `cls` is its classifyHeading() result (null: the user's own)
+//   item    — a top-level bullet with its nested block in `children`
+//   text    — any other line
+// Frontmatter and fenced code are text whatever they contain. Each block
+// carries the `section` it sits in (the last recognized heading above it,
+// 'preamble' before the first). Once a recognized heading has appeared, a
+// heading of the user's own opens a `foreign` stretch that runs to the next
+// recognized heading: it is theirs, kept verbatim, and its bullets are not
+// list items.
+function scanNote(content) {
+    const lines = content.split('\n');
+    const blocks = [];
+    let section = 'preamble';
+    let sawRecognized = false;
+    let foreign = false;
+    const text = (from, to) => {
+        for (let k = from; k < to; k++) blocks.push({ type: 'text', line: lines[k], lineNo: k, section, foreign });
+    };
+
+    let i = 0;
+    if (/^---\s*$/.test(lines[0])) {
+        for (let j = 1; j < lines.length; j++) {
+            if (/^(---|\.\.\.)\s*$/.test(lines[j])) { text(0, j + 1); i = j + 1; break; }
+        }
+    }
+    while (i < lines.length) {
+        const line = lines[i];
+        if (FENCE_RE.test(line)) {
+            const end = fenceEnd(lines, i);
+            text(i, end);
+            i = end;
+            continue;
+        }
+        const h = line.match(HEADING_RE);
+        if (h) {
+            const cls = classifyHeading(h[1]);
+            if (cls !== null) { section = cls; sawRecognized = true; foreign = false; }
+            else if (sawRecognized) foreign = true;
+            blocks.push({ type: 'heading', line, lineNo: i, cls, section, foreign });
+            i++;
+            continue;
+        }
+        const m = foreign ? null : line.match(BULLET_RE);
+        if (m) {
+            const end = itemEnd(lines, i + 1, m[1].length);
+            blocks.push({ type: 'item', line, lineNo: i, raw: m[2], children: lines.slice(i + 1, end), section, foreign });
+            i = end;
+            continue;
+        }
+        text(i, i + 1);
+        i++;
+    }
+    return blocks;
+}
+
+// An item block's checkbox state and text. A checkbox with nothing after it
+// is still a checkbox.
+function readItem(block) {
+    const raw = block.raw.trim();
+    const box = raw.match(/^\[([ xX])\](?:\s+(.*))?$/);
+    if (!box) return { done: false, item: { text: raw, isTask: false, children: block.children } };
+    return { done: box[1] !== ' ', item: { text: (box[2] || '').trim(), isTask: true, children: block.children } };
+}
+
+function isQuadrantKey(key) {
+    return QUADRANTS.some(q => q.key === key);
+}
+
+function parseNote(content) {
+    const blocks = scanNote(content);
+
+    // Matrix mode: any heading that classifies as a quadrant. Inbox, TODO,
+    // and Done headings don't make a note a matrix — a flat ranked list has
+    // those sections too.
+    const matrixMode = blocks.some(b => b.type === 'heading' && isQuadrantKey(b.cls));
 
     if (!matrixMode) {
         const items = [];
         const done  = [];
         const inbox = [];
-        let inInbox = false;
-        let i = 0;
-        while (i < lines.length) {
-            const h = lines[i].match(/^#{1,6}\s+(.+)$/);
-            if (h) { inInbox = classifyHeading(h[1]) === 'inbox'; i++; continue; }
-            const m = lines[i].match(BULLET_RE);
-            if (!m) { i++; continue; }
-            // A top-level bullet owns the contiguous deeper-indented lines
-            // below it (nested bullets, sub-tasks, continuation text). They
-            // travel with it as a block so sorting preserves nested structure.
-            const indent = m[1].length;
-            const children = [];
-            let j = i + 1;
-            while (j < lines.length && isNestedLine(lines[j], indent)) { children.push(lines[j]); j++; }
-            i = j;
-            let text = m[2].trim();
-            const doneMatch = text.match(/^\[[xX]\]\s+(.+)$/);
-            if (doneMatch) { done.push({ text: doneMatch[1], isTask: true, children }); continue; }
-            let isTask = false;
-            const taskMatch = text.match(/^\[ \]\s+(.+)$/);
-            if (taskMatch) { isTask = true; text = taskMatch[1]; }
-            (inInbox ? inbox : items).push({ text, isTask, children });
+        for (const b of blocks) {
+            if (b.type !== 'item') continue;
+            const r = readItem(b);
+            if (r.done) done.push(r.item);
+            else (b.section === 'inbox' ? inbox : items).push(r.item);
         }
         return { mode: 'flat', items, done, inbox };
     }
 
-    // Matrix mode: bucket items by surrounding heading. Active bullets above
-    // the first quadrant heading default to Q2. Done items always go to done.
+    // Bucket items by surrounding heading. Active bullets outside a quadrant
+    // or the Inbox default to Q2. Done items always go to done.
     const sections = emptySections();
-    let section = 'preamble';
-    let sawQuadrant = false;
-    let lastItem = null;
-    let lastIndent = 0;
-    const preamble = [];
-
-    for (const line of lines) {
-        const headingMatch = line.match(/^#{1,6}\s+(.+)$/);
-        if (headingMatch) {
-            lastItem = null;
-            const cls = classifyHeading(headingMatch[1]);
-            if (cls !== null) { section = cls; sawQuadrant = true; continue; }
-            if (!sawQuadrant) preamble.push(line);
+    for (const b of blocks) {
+        if (b.type !== 'item') continue;
+        const r = readItem(b);
+        if (r.done) {
+            const quadrant = QUADRANTS.find(q => q.key === b.section);
+            if (quadrant) r.item.text = withDoneTags(r.item.text, quadrant);
+            sections.done.push(r.item);
             continue;
         }
-
-        // Lines indented past a bullet are its nested block — keep them with it.
-        if (lastItem && isNestedLine(line, lastIndent)) { lastItem.children.push(line); continue; }
-
-        const bulletMatch = line.match(BULLET_RE);
-        if (bulletMatch) {
-            lastIndent = bulletMatch[1].length;
-            let text = bulletMatch[2].trim();
-            const doneMatch = text.match(/^\[[xX]\]\s+(.+)$/);
-            if (doneMatch) {
-                const quadrant = QUADRANTS.find(q => q.key === section);
-                const doneText = quadrant ? withDoneTags(doneMatch[1], quadrant) : doneMatch[1];
-                lastItem = { text: doneText, isTask: true, children: [] };
-                sections.done.push(lastItem);
-                continue;
-            }
-            let isTask = false;
-            const taskMatch = text.match(/^\[ \]\s+(.+)$/);
-            if (taskMatch) { isTask = true; text = taskMatch[1]; }
-            const bucket = (section === 'preamble' || section === 'todo' || section === 'done') ? 'Q2' : section;
-            lastItem = { text, isTask, children: [] };
-            sections[bucket].push(lastItem);
-            continue;
-        }
-
-        lastItem = null;
-        if (!sawQuadrant) preamble.push(line);
+        const bucket = (b.section === 'inbox' || isQuadrantKey(b.section)) ? b.section : 'Q2';
+        sections[bucket].push(r.item);
     }
-
-    return { mode: 'matrix', preamble, sections };
+    return { mode: 'matrix', sections };
 }
 
 function renderItemLine(item) {
-    return item.isTask ? `- [ ] ${item.text}` : `- ${item.text}`;
+    return (item.isTask ? `- [ ] ${item.text}` : `- ${item.text}`).trimEnd();
 }
 
 // An item plus its nested lines, rendered as a block of lines that move together.
@@ -171,6 +226,25 @@ function renderItemBlock(item) {
     return block;
 }
 
+function renderDoneBlock(item) {
+    const block = [`- [x] ${item.text}`.trimEnd()];
+    if (item.children && item.children.length) block.push(...item.children);
+    return block;
+}
+
+// A save ends with a newline exactly when the note it replaces did.
+function matchFinalNewline(original, text) {
+    if (original.endsWith('\n') && !text.endsWith('\n')) return text + '\n';
+    return text;
+}
+
+function trimBlankLines(lines) {
+    let a = 0, b = lines.length;
+    while (a < b && lines[a].trim() === '') a++;
+    while (b > a && lines[b - 1].trim() === '') b--;
+    return lines.slice(a, b);
+}
+
 // `inboxItems` controls the Inbox section: null leaves its bullets untouched
 // (ordinary saves — inbox items are unranked and stay put); an array rewrites
 // the section to exactly those items (a triage passes what's still unplaced,
@@ -178,72 +252,50 @@ function renderItemBlock(item) {
 //
 // Whatever the note looked like before, the save lands in the canonical
 // layout: Inbox at the top, the ranked list under a TODO heading, Done at
-// the bottom. Prose outside those sections stays where it was. The TODO
+// the bottom. Everything that isn't a list item stays where it was. The TODO
 // heading only appears when there's an Inbox section to terminate (or the
 // note already had one), and Done only when there are done items to hold
 // (or the heading already existed) — a plain list stays a plain list.
 function serializeFlat(content, sortedItems, inboxItems = null) {
     const replacements = sortedItems.map(renderItemBlock);
 
-    const lines = content.split('\n');
     const body = [];
     const inboxBlock = [];   // captured contents of the original Inbox section
     const doneBlocks = [];
     let hadInbox = false, hadTodo = false, hadDone = false;
     let firstSortedIdx = -1;
     let lastSortedIdx = -1;
-    let inInbox = false;
     let idx = 0;
-    let i = 0;
 
-    while (i < lines.length) {
-        const line = lines[i];
-        const h = line.match(/^#{1,6}\s+(.+)$/);
-        if (h) {
-            const cls = classifyHeading(h[1]);
-            inInbox = cls === 'inbox';
+    for (const b of scanNote(content)) {
+        if (b.type === 'heading') {
             // Recognized section headings are re-emitted in canonical
             // position below; everything else stays in place.
-            if (cls === 'inbox') { hadInbox = true; i++; continue; }
-            if (cls === 'todo')  { hadTodo = true;  i++; continue; }
-            if (cls === 'done')  { hadDone = true;  i++; continue; }
-            body.push(line);
-            i++;
-        } else if (/^ {0,3}[-*+] \[[xX]\]\s/.test(line)) {
-            // Done item: keep its block verbatim and stash it for the Done section.
-            const indent = indentWidth(line);
-            const block = [line];
-            i++;
-            while (i < lines.length && isNestedLine(lines[i], indent)) { block.push(lines[i]); i++; }
-            doneBlocks.push(block);
-        } else if (inInbox) {
-            // The Inbox section travels to the top as-is. Its bullets are
-            // unranked and don't participate in sorting — unless the caller
-            // is rewriting the Inbox, in which case they're replaced.
-            if (BULLET_RE.test(line)) {
-                const indent = indentWidth(line);
-                const block = [line];
-                i++;
-                while (i < lines.length && isNestedLine(lines[i], indent)) { block.push(lines[i]); i++; }
+            if (b.cls === 'inbox') { hadInbox = true; continue; }
+            if (b.cls === 'todo')  { hadTodo = true;  continue; }
+            if (b.cls === 'done')  { hadDone = true;  continue; }
+            body.push(b.line);
+        } else if (b.type === 'item') {
+            const block = [b.line, ...b.children];
+            if (readItem(b).done) {
+                // Done item: keep its block verbatim and stash it for the Done section.
+                doneBlocks.push(block);
+            } else if (b.section === 'inbox') {
+                // The Inbox section travels to the top as-is. Its bullets are
+                // unranked and don't participate in sorting — unless the caller
+                // is rewriting the Inbox, in which case they're replaced.
                 if (!inboxItems) inboxBlock.push(...block);
-            } else {
-                if (line.trim() !== '') inboxBlock.push(line);
-                i++;
-            }
-        } else if (BULLET_RE.test(line)) {
-            // Active bullet: swap in the next ranked block, dropping the original
-            // nested lines (they ride along inside the replacement block).
-            const indent = indentWidth(line);
-            i++;
-            while (i < lines.length && isNestedLine(lines[i], indent)) i++;
-            if (idx < replacements.length) {
+            } else if (idx < replacements.length) {
+                // Active bullet: swap in the next ranked block (the original
+                // nested lines ride along inside the replacement).
                 if (firstSortedIdx < 0) firstSortedIdx = body.length;
                 body.push(...replacements[idx++]);
                 lastSortedIdx = body.length - 1;
             }
+        } else if (b.section === 'inbox' && !b.foreign) {
+            if (b.line.trim() !== '') inboxBlock.push(b.line);
         } else {
-            body.push(line);
-            i++;
+            body.push(b.line);
         }
     }
 
@@ -281,70 +333,101 @@ function serializeFlat(content, sortedItems, inboxItems = null) {
         for (const block of doneBlocks) body.push(...block);
     }
 
-    // Extracting headings can leave doubled blank lines behind — collapse them.
+    // Extracting headings can leave doubled blank lines behind — collapse
+    // them, except inside fenced code, where they are content.
     const out = [];
+    let fence = null;
     for (const line of body) {
-        if (line.trim() === '' && out.length && out[out.length - 1].trim() === '') continue;
+        if (fence) {
+            if (fence.test(line)) fence = null;
+        } else {
+            const f = line.match(FENCE_RE);
+            if (f) fence = new RegExp(`^\\s*${f[1][0]}{${f[1].length},}\\s*$`);
+            else if (line.trim() === '' && out.length && out[out.length - 1].trim() === '') continue;
+        }
         out.push(line);
     }
-    return out.join('\n');
+    return matchFinalNewline(content, out.join('\n'));
 }
 
-// Everything above the first recognized heading, minus top-level bullet
-// blocks — those were parsed into sections and re-render below the preamble.
-function extractPreamble(lines) {
+// What a matrix (or to-be-matrix) note holds besides its list items, so a
+// rewrite in the canonical layout can put all of it back:
+//   preamble — everything above the first recognized heading
+//   extras   — per section, the prose around its items: `lead` above the
+//              first item, `trail` from there on
+//   tail     — the user's own headed sections, which follow Done
+function matrixLayout(content) {
     const preamble = [];
-    for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(/^#{1,6}\s+(.+)$/);
-        if (m && classifyHeading(m[1]) !== null) break;
-        if (BULLET_RE.test(lines[i])) {
-            const indent = indentWidth(lines[i]);
-            while (i + 1 < lines.length && isNestedLine(lines[i + 1], indent)) i++;
+    const extras = {};
+    const tail = [];
+    const sawItem = {};
+    let hadInbox = false, hadTodo = false;
+    for (const b of scanNote(content)) {
+        if (b.type === 'heading' && b.cls !== null) {
+            if (b.cls === 'inbox') hadInbox = true;
+            if (b.cls === 'todo') hadTodo = true;
             continue;
         }
-        preamble.push(lines[i]);
+        if (b.foreign) { tail.push(b.line); continue; }
+        if (b.type === 'item') { sawItem[b.section] = true; continue; }
+        if (b.section === 'preamble') { preamble.push(b.line); continue; }
+        if (!extras[b.section]) extras[b.section] = { lead: [], trail: [] };
+        (sawItem[b.section] ? extras[b.section].trail : extras[b.section].lead).push(b.line);
     }
-    while (preamble.length && preamble[preamble.length - 1].trim() === '') preamble.pop();
-    return preamble;
+    const groups = (key) => {
+        const e = extras[key] || { lead: [], trail: [] };
+        return { lead: trimBlankLines(e.lead), trail: trimBlankLines(e.trail) };
+    };
+    return { preamble: trimBlankLines(preamble), groups, tail: trimBlankLines(tail), hadInbox, hadTodo };
+}
+
+// Append a heading and the groups of lines under it, a blank line between
+// groups; empty groups are skipped.
+function pushSection(out, heading, groups) {
+    if (heading) out.push(heading);
+    let first = true;
+    for (const g of groups) {
+        if (g.length === 0) continue;
+        if (!first) out.push('');
+        out.push(...g);
+        first = false;
+    }
 }
 
 // Rewrite a matrix note in the canonical layout: preamble, Inbox at the top,
-// the four quadrants nested under a TODO heading, Done at the bottom.
+// the four quadrants nested under a TODO heading, Done at the bottom, then
+// any sections of the user's own.
 function serializeMatrix(originalContent, sections) {
-    const lines = originalContent.split('\n');
-    let hadInbox = false;
-    for (const line of lines) {
-        const m = line.match(/^#{1,6}\s+(.+)$/);
-        if (m && classifyHeading(m[1]) === 'inbox') { hadInbox = true; break; }
-    }
-    const preamble = extractPreamble(lines);
-
+    const layout = matrixLayout(originalContent);
     const out = [];
-    if (preamble.length > 0) { out.push(...preamble); out.push(''); }
+    if (layout.preamble.length > 0) { out.push(...layout.preamble); out.push(''); }
 
     const inboxItems = sections.inbox || [];
+    const inbox = layout.groups('inbox');
     // Keep the (possibly emptied) Inbox heading around as a capture spot.
-    if (hadInbox || inboxItems.length > 0) {
-        out.push(`## ${INBOX_HEADING}`);
-        for (const item of inboxItems) out.push(...renderItemBlock(item));
+    if (layout.hadInbox || inboxItems.length > 0 || inbox.lead.length > 0 || inbox.trail.length > 0) {
+        pushSection(out, `## ${INBOX_HEADING}`, [inbox.lead, inboxItems.flatMap(renderItemBlock), inbox.trail]);
         out.push('');
     }
 
+    const todo = layout.groups('todo');
     out.push(`## ${TODO_HEADING}`);
     out.push('');
+    if (todo.lead.length > 0 || todo.trail.length > 0) {
+        pushSection(out, null, [todo.lead, todo.trail]);
+        out.push('');
+    }
     for (const q of QUADRANTS) {
-        out.push(`### ${q.heading}`);
-        for (const item of sections[q.key]) out.push(...renderItemBlock(item));
+        const g = layout.groups(q.key);
+        pushSection(out, `### ${q.heading}`, [g.lead, sections[q.key].flatMap(renderItemBlock), g.trail]);
         out.push('');
     }
 
-    out.push(`## ${DONE_HEADING}`);
-    for (const item of sections.done) {
-        out.push(`- [x] ${item.text}`);
-        if (item.children && item.children.length) out.push(...item.children);
-    }
+    const done = layout.groups('done');
+    pushSection(out, `## ${DONE_HEADING}`, [done.lead, sections.done.flatMap(renderDoneBlock), done.trail]);
+    if (layout.tail.length > 0) { out.push(''); out.push(...layout.tail); }
 
-    return out.join('\n');
+    return matchFinalNewline(originalContent, out.join('\n'));
 }
 
 // The inverse of serializeMatrix: flatten a matrix note back into a single
@@ -353,42 +436,117 @@ function serializeMatrix(originalContent, sections) {
 // order — Do, then Delegate, then Schedule, then Delete — with each
 // quadrant's internal ranking intact. Done items keep their checkboxes (and
 // the #urgent/#important tags they picked up in the matrix, so the
-// classification survives a round-trip).
+// classification survives a round-trip). Prose that sat in the quadrants
+// follows the list.
 function serializeFlatFromMatrix(originalContent, sections) {
-    const lines = originalContent.split('\n');
-    let hadInbox = false, hadTodo = false;
-    for (const line of lines) {
-        const m = line.match(/^#{1,6}\s+(.+)$/);
-        const cls = m ? classifyHeading(m[1]) : null;
-        if (cls === 'inbox') hadInbox = true;
-        if (cls === 'todo') hadTodo = true;
-    }
-    const preamble = extractPreamble(lines);
-
+    const layout = matrixLayout(originalContent);
     const out = [];
-    if (preamble.length > 0) { out.push(...preamble); out.push(''); }
+    if (layout.preamble.length > 0) { out.push(...layout.preamble); out.push(''); }
 
     const inboxItems = sections.inbox || [];
-    const emitInbox = hadInbox || inboxItems.length > 0;
+    const inbox = layout.groups('inbox');
+    const emitInbox = layout.hadInbox || inboxItems.length > 0 || inbox.lead.length > 0 || inbox.trail.length > 0;
     if (emitInbox) {
-        out.push(`## ${INBOX_HEADING}`);
-        for (const item of inboxItems) out.push(...renderItemBlock(item));
+        pushSection(out, `## ${INBOX_HEADING}`, [inbox.lead, inboxItems.flatMap(renderItemBlock), inbox.trail]);
         out.push('');
     }
-    if (emitInbox || hadTodo) out.push(`## ${TODO_HEADING}`);
 
+    const todo = layout.groups('todo');
+    const list = [];
+    const prose = [];
     for (const q of QUADRANTS) {
-        for (const item of sections[q.key]) out.push(...renderItemBlock(item));
+        list.push(...sections[q.key].flatMap(renderItemBlock));
+        const g = layout.groups(q.key);
+        prose.push(g.lead, g.trail);
     }
+    pushSection(out, (emitInbox || layout.hadTodo) ? `## ${TODO_HEADING}` : null, [todo.lead, todo.trail, list, ...prose]);
 
+    const done = layout.groups('done');
     out.push('');
-    out.push(`## ${DONE_HEADING}`);
-    for (const item of sections.done) {
-        out.push(`- [x] ${item.text}`);
-        if (item.children && item.children.length) out.push(...item.children);
+    pushSection(out, `## ${DONE_HEADING}`, [done.lead, sections.done.flatMap(renderDoneBlock), done.trail]);
+    if (layout.tail.length > 0) { out.push(''); out.push(...layout.tail); }
+
+    return matchFinalNewline(originalContent, out.join('\n'));
+}
+
+// ── Saving against a note that changed meanwhile ────────────────────────────
+//
+// A session works on the note as it was when the modal opened. By the time
+// it saves, the note may have moved on — the nightly sweep added to the
+// Inbox, sync delivered another device's edit. rebaseResult() carries the
+// session's outcome over to the note as it is now: items the session
+// arranged keep that arrangement, items that have since gone are dropped,
+// and items that have since appeared stay in the section they appeared in.
+// Items are told apart by checkbox state and text.
+
+function resultBuckets(r) {
+    if (r.mode === 'flat') {
+        const b = { items: r.items };
+        if (r.inbox) b.inbox = r.inbox;
+        if (r.done) b.done = r.done;
+        return b;
+    }
+    return r.sections;
+}
+
+function bucketKeyOf(name, item) {
+    return `${name === 'done' ? 'x' : item.isTask ? 't' : 'b'}\u0000${item.text}`;
+}
+
+// Returns the rebased result, or null when the note changed shape (flat ↔
+// matrix) and the session's outcome no longer applies to it.
+function rebaseResult(result, snapshot, fresh) {
+    if (snapshot.mode !== fresh.mode) return null;
+    const out = resultBuckets(result);
+    const was = resultBuckets(snapshot);
+    const now = resultBuckets(fresh);
+    // A flat result that leaves the Inbox or Done alone doesn't carry them,
+    // and the serializer takes those from the note itself.
+    const names = Object.keys(out);
+    // Where an item that appeared in one of the note's sections belongs in
+    // the result — the same section, or the Inbox when the result is a
+    // matrix made from a flat list.
+    const home = (name) => (name in out ? name : (name === 'items' && 'inbox' in out ? 'inbox' : null));
+
+    const wasCount = new Map();
+    const nowItems = new Map();
+    for (const name of Object.keys(was)) {
+        if (home(name) === null) continue;
+        for (const item of was[name]) {
+            const k = bucketKeyOf(name, item);
+            wasCount.set(k, (wasCount.get(k) || 0) + 1);
+        }
+    }
+    for (const name of Object.keys(now)) {
+        if (home(name) === null) continue;
+        for (const item of now[name]) {
+            const k = bucketKeyOf(name, item);
+            if (!nowItems.has(k)) nowItems.set(k, []);
+            nowItems.get(k).push({ item, name });
+        }
     }
 
-    return out.join('\n');
+    const rebased = {};
+    for (const name of names) {
+        rebased[name] = [];
+        for (const item of out[name]) {
+            const k = bucketKeyOf(name, item);
+            if (!(wasCount.get(k) > 0)) { rebased[name].push(item); continue; }   // added by the session
+            wasCount.set(k, wasCount.get(k) - 1);
+            const current = nowItems.get(k);
+            if (!current || current.length === 0) continue;                // gone from the note
+            // The note's own copy, so edits to its nested lines are kept.
+            rebased[name].push({ ...item, children: current.shift().item.children });
+        }
+    }
+    // Whatever the note holds that the session did not place — it appeared
+    // meanwhile — stays in its section.
+    for (const list of nowItems.values()) {
+        for (const { item, name } of list) rebased[home(name)].push(item);
+    }
+
+    if (result.mode === 'flat') return { ...result, ...rebased };
+    return { ...result, sections: rebased };
 }
 
 // A one-line footer telling the user that closing the modal doesn't lose work.
@@ -403,7 +561,8 @@ class RankSessionModal extends obsidian.Modal {
         super(app);
         this.payload = payload;
         this.onComplete = onComplete;
-        this.comparisonCount = 0;
+        this.comparisonCount = 0;   // questions shown, for the progress bar
+        this.answered = 0;          // questions answered
         // Partial-progress state, so closing mid-session saves what's decided.
         this.finished = false;      // a result was already handed to onComplete
         this.finalResult = null;    // full result shown on the results screen
@@ -434,8 +593,10 @@ class RankSessionModal extends obsidian.Modal {
     onClose() {
         this.contentEl.empty();
         if (this.finished) return;
-        const result = this.finalResult ||
-            (this.comparisonCount > 0 ? this.buildPartialResult() : null);
+        // A flat session has something to keep after one answer; a matrix
+        // session once an item has had both of its questions answered.
+        const decided = this.payload.mode === 'flat' ? this.answered > 0 : this.entryIdx > 0;
+        const result = this.finalResult || (decided ? this.buildPartialResult() : null);
         if (!result) return;
         this.finished = true;
         this.onComplete(result, !this.finalResult);
@@ -548,14 +709,14 @@ class RankSessionModal extends obsidian.Modal {
     askCompare(a, b) {
         return new Promise(resolve => {
             this.comparisonCount++;
-            this.renderComparison(a, b, resolve);
+            this.renderComparison(a, b, (v) => { this.answered++; resolve(v); });
         });
     }
 
     askClassify(item, question, explainer, yesLabel, noLabel) {
         return new Promise(resolve => {
             this.comparisonCount++;
-            this.renderClassify(item, question, explainer, yesLabel, noLabel, resolve);
+            this.renderClassify(item, question, explainer, yesLabel, noLabel, (v) => { this.answered++; resolve(v); });
         });
     }
 
@@ -1411,8 +1572,9 @@ function computeResult(originalContent, result) {
     return serializeMatrix(originalContent, result.sections);
 }
 
-function applyResult(editor, originalContent, result) {
-    editor.setValue(computeResult(originalContent, result));
+// A read/write handle on an editor, the same shape as the plugin's fileTarget().
+function editorTarget(editor) {
+    return { read: async () => editor.getValue(), write: async (c) => editor.setValue(c) };
 }
 
 function totalActiveItems(parsed) {
@@ -1451,7 +1613,7 @@ function tagDoneLines(content, decisions) {
         const text = m[2].trim();
         if (hasDoneTags(text)) return line;
         const tags = decisions.get(text);
-        return tags === undefined ? line : `${m[1]}${text}${tags}`;
+        return tags === undefined ? line : `${m[1]}${appendTags(text, tags)}`;
     }).join('\n');
 }
 
@@ -1586,6 +1748,7 @@ const DEFAULT_SETTINGS = {
         enabled: false,
         linkSource: true,          // append a wiki link to the daily note each item came from
         lastSweptDaystamp: '',     // YYYYMMDD of the last nightly/catch-up sweep
+        pendingDays: [],           // daystamps passed over for want of a note, retried for a week
     },
     weeklyReview: {
         enabled: false,
@@ -1691,6 +1854,21 @@ async function readWordCount(app, path) {
     return 0;
 }
 
+// A request that never settles (the machine slept mid-flight and the socket
+// never came back) would otherwise hold its job's running flag until the
+// plugin is reloaded. Timers stall during suspend too, so the limit is
+// counted in time awake — late, but it arrives.
+const BEEMINDER_TIMEOUT_MS = 60 * 1000;
+const CLAUDE_TIMEOUT_MS = 5 * 60 * 1000;
+
+function withTimeout(promise, ms, what) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = window.setTimeout(() => reject(new Error(`${what} timed out after ${Math.round(ms / 1000)} s`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timer));
+}
+
 async function submitToBeeminder(s, authToken, value, daystamp, comment) {
     const url = `https://www.beeminder.com/api/v1/users/${encodeURIComponent(s.username)}/goals/${encodeURIComponent(s.goalName)}/datapoints.json`;
     const body = new URLSearchParams({
@@ -1701,13 +1879,13 @@ async function submitToBeeminder(s, authToken, value, daystamp, comment) {
         // Stable per-day id: re-running the same day updates rather than duplicates.
         requestid: `factotum-wordcount-${daystamp}`,
     }).toString();
-    return obsidian.requestUrl({
+    return withTimeout(obsidian.requestUrl({
         url,
         method: 'POST',
         contentType: 'application/x-www-form-urlencoded',
         body,
         throw: false,
-    });
+    }), BEEMINDER_TIMEOUT_MS, 'Beeminder request');
 }
 
 // ── Periodic reviews (weekly / monthly / quarterly / yearly) ───────────────
@@ -1784,6 +1962,8 @@ function periodStampOf(k, m) {
     return k.stamp ? k.stamp(periodStart(k, m)) : m.format(k.stampFormat);
 }
 
+const CLAUDE_MAX_TOKENS = 16000;
+
 function ordinal(n) {
     const tens = n % 100;
     if (tens >= 11 && tens <= 13) return `${n}th`;
@@ -1791,8 +1971,10 @@ function ordinal(n) {
     return `${n}${suffix}`;
 }
 
+// `truncated` reports a reply that ran into max_tokens: whatever text came
+// back stops mid-thought.
 async function callClaude(apiKey, model, system, userContent) {
-    const res = await obsidian.requestUrl({
+    const res = await withTimeout(obsidian.requestUrl({
         url: 'https://api.anthropic.com/v1/messages',
         method: 'POST',
         contentType: 'application/json',
@@ -1802,17 +1984,17 @@ async function callClaude(apiKey, model, system, userContent) {
         },
         body: JSON.stringify({
             model,
-            max_tokens: 8000,
+            max_tokens: CLAUDE_MAX_TOKENS,
             system,
             messages: [{ role: 'user', content: userContent }],
         }),
         throw: false,
-    });
+    }), CLAUDE_TIMEOUT_MS, 'Claude request');
     if (res.status < 200 || res.status >= 300) {
-        return { ok: false, status: res.status, text: '' };
+        return { ok: false, status: res.status, text: '', truncated: false };
     }
     const block = (res.json?.content || []).find(b => b.type === 'text');
-    return { ok: true, status: res.status, text: block ? block.text : '' };
+    return { ok: true, status: res.status, text: block ? block.text : '', truncated: res.json?.stop_reason === 'max_tokens' };
 }
 
 // ── Daily to-do sweep ───────────────────────────────────────────────────────
@@ -1827,6 +2009,7 @@ async function callClaude(apiKey, model, system, userContent) {
 // active note without making the sweep unconfigured).
 
 const SWEEP_DEFAULT_TODO_PATH = 'TODO.md';
+const SWEEP_MAX_PARSE_FAILURES = 3;
 
 const SWEEP_SYSTEM =
     'You extract to-do items from one day\'s journal note in Obsidian. The note is informal, ' +
@@ -1865,17 +2048,27 @@ function parseSweepItems(text) {
     return out;
 }
 
+// A to-do as it would be compared: a list line's bullet, checkbox, and
+// trailing source link dropped, case and spacing folded.
+function sweepKey(text) {
+    return text
+        .replace(/^\s*[-*+]\s+(\[[ xX]\]\s+)?/, '')
+        .replace(/\s*\(\[\[[^\]]*\]\]\)\s*$/, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+}
+
 // Add items to the end of the note's Inbox section, touching nothing else.
 // A note without an Inbox heading yet is rewritten in the canonical layout
 // (Inbox on top, list under TODO) by the same serializers every save uses.
 function appendToInbox(content, items) {
     const lines = content.split('\n');
     let start = -1, end = lines.length;
-    for (let i = 0; i < lines.length; i++) {
-        const h = lines[i].match(/^#{1,6}\s+(.+)$/);
-        if (!h) continue;
-        if (start < 0) { if (classifyHeading(h[1]) === 'inbox') start = i; }
-        else { end = i; break; }
+    for (const b of scanNote(content)) {
+        if (b.type !== 'heading') continue;
+        if (start < 0) { if (b.cls === 'inbox') start = b.lineNo; }
+        else { end = b.lineNo; break; }
     }
     if (start < 0) {
         const parsed = parseNote(content);
@@ -1919,7 +2112,7 @@ function reviewSystem(k, sourceDesc, hasGoals) {
 
 // Reviews are sent to Claude in one request, so their input must fit the
 // model context (~200k tokens) with room left for the system prompt, the
-// goals block, and the 8k-token output. Estimated as chars/4.
+// goals block, and the output (CLAUDE_MAX_TOKENS). Estimated as chars/4.
 const REVIEW_INPUT_TOKEN_BUDGET = 150000;
 const REVIEW_INPUT_CHAR_BUDGET = REVIEW_INPUT_TOKEN_BUDGET * 4;
 
@@ -1977,8 +2170,10 @@ class ReflectionFeedView extends obsidian.ItemView {
         super(leaf);
         this.plugin = plugin;
         this.deck = [];
-        this.loading = false;
         this.generation = 0;       // bumped on restart so an in-flight load drops its stale cards
+        this.loadingGen = null;    // the generation a load is in flight for, if any
+        this.lastShown = null;     // path of the last note dealt, to keep a reshuffle from repeating it
+        this.renderChild = null;   // owns the current generation's rendered markdown
         this.navigation = false;
         // Created here, not in onOpen: Obsidian pushes view.scope when the leaf
         // becomes active, which can precede onOpen.
@@ -2046,7 +2241,12 @@ class ReflectionFeedView extends obsidian.ItemView {
         bind(['Shift'], 'k', () => this.snapToCard(-1));
         bind(['Shift'], 'g', () => root.scrollTo({ top: root.scrollHeight, behavior: 'smooth' }));
         bind([], 'o',     () => this.openCardInView());
-        bind([], 'Enter', () => this.openCardInView());
+        // Enter on a focused button (a card's "Read more") is that button's.
+        this.scope.register([], 'Enter', (evt) => {
+            if (evt.target?.closest?.('button')) return true;
+            this.openCardInView();
+            return false;
+        });
         bind([], 'r',     () => this.restart());
 
         // gg: two g's within a second jump to the top.
@@ -2115,29 +2315,47 @@ class ReflectionFeedView extends obsidian.ItemView {
 
     reshuffle() {
         this.deck = shuffleInPlace(this.candidates());
-        this.dealt = 0;
+        this.shown = 0;            // notes dealt this round that passed the filters
         this.deckSize = this.deck.length;
+        // The deck is dealt from its end; don't open a round with the note
+        // the last one closed on.
+        const top = this.deck.length - 1;
+        if (top > 0 && this.deck[top].path === this.lastShown) {
+            const j = Math.floor(Math.random() * top);
+            [this.deck[top], this.deck[j]] = [this.deck[j], this.deck[top]];
+        }
     }
 
     // Returns the next note whose body has something worth reading, or null
-    // when the vault has nothing that passes the filters.
-    async drawNote() {
+    // when the vault has nothing that passes the filters — a whole round
+    // dealt without a single note shown — or when the feed was restarted
+    // meanwhile (`gen` is the generation the caller is loading for).
+    async drawNote(gen) {
         const minChars = Math.max(0, this.plugin.settings.reflectionFeed.minChars | 0);
-        for (let tries = 0; tries < 200; tries++) {
+        for (;;) {
+            if (gen !== this.generation) return null;
             if (this.deck.length === 0) {
-                if (this.dealt === 0) return null;       // nothing passed the filters last round
+                if (this.shown === 0) return null;
                 this.reshuffle();
                 if (this.deck.length === 0) return null;
                 this.setStatus('Every note has been shown once — reshuffled.');
             }
             const file = this.deck.pop();
-            this.dealt++;
-            if (!(file instanceof obsidian.TFile)) continue;   // deleted since the deck was built
-            const body = this.stripFrontmatter(file, await this.app.vault.cachedRead(file));
+            // Deleted or renamed since the deck was built.
+            if (this.app.vault.getAbstractFileByPath(file.path) !== file) continue;
+            let content;
+            try {
+                content = await this.app.vault.cachedRead(file);
+            } catch (e) {
+                continue;
+            }
+            if (gen !== this.generation) return null;
+            const body = this.stripFrontmatter(file, content);
             if (body.trim().length < minChars) continue;
+            this.shown++;
+            this.lastShown = file.path;
             return { file, body };
         }
-        return null;
     }
 
     stripFrontmatter(file, content) {
@@ -2151,8 +2369,12 @@ class ReflectionFeedView extends obsidian.ItemView {
     // ── Rendering ─────────────────────────────────────────────────────────
 
     async restart() {
+        if (!this.cardsEl) return;   // a key pressed before the view opened
         this.generation++;
-        this.loading = false;
+        // Everything the old cards rendered (embeds, other plugins'
+        // post-processors) is unloaded with them.
+        if (this.renderChild) this.removeChild(this.renderChild);
+        this.renderChild = this.addChild(new obsidian.Component());
         this.reshuffle();
         this.cardsEl.empty();
         this.setStatus('');
@@ -2165,14 +2387,17 @@ class ReflectionFeedView extends obsidian.ItemView {
         this.statusEl.toggleClass('is-empty', !text);
     }
 
+    // One load at a time per generation: a restart mid-load starts its own,
+    // and the stale one must not release the new one's claim when it ends.
     async loadMore() {
-        if (this.loading) return;
-        this.loading = true;
+        if (!this.cardsEl) return;
+        const gen = this.generation;
+        if (this.loadingGen === gen) return;
+        this.loadingGen = gen;
         try {
-            const gen = this.generation;
             const batch = Math.max(1, this.plugin.settings.reflectionFeed.batchSize | 0);
             for (let i = 0; i < batch; i++) {
-                const note = await this.drawNote();
+                const note = await this.drawNote(gen);
                 if (gen !== this.generation) return;     // restarted meanwhile
                 if (!note) {
                     if (this.cardsEl.childElementCount === 0) {
@@ -2183,8 +2408,11 @@ class ReflectionFeedView extends obsidian.ItemView {
                 await this.renderCard(note.file, note.body, gen);
                 if (gen !== this.generation) return;
             }
+        } catch (e) {
+            console.error('Factotum — reflection feed could not load more notes', e);
+            return;
         } finally {
-            this.loading = false;
+            if (this.loadingGen === gen) this.loadingGen = null;
         }
         // Short notes may leave the sentinel still on screen, and the observer
         // only fires on *changes* — so keep filling until it's out of view.
@@ -2236,9 +2464,9 @@ class ReflectionFeedView extends obsidian.ItemView {
     async renderMarkdown(markdown, el, sourcePath) {
         const R = obsidian.MarkdownRenderer;
         if (typeof R.render === 'function') {
-            await R.render(this.app, markdown, el, sourcePath, this);
+            await R.render(this.app, markdown, el, sourcePath, this.renderChild);
         } else {
-            await R.renderMarkdown(markdown, el, sourcePath, this);
+            await R.renderMarkdown(markdown, el, sourcePath, this.renderChild);
         }
     }
 }
@@ -2248,16 +2476,26 @@ class ReflectionFeedView extends obsidian.ItemView {
 const SCHEDULE_TICK_MS = 60 * 1000;
 const RETRY_MIN_MS = 5 * 60 * 1000;
 const RETRY_MAX_MS = 60 * 60 * 1000;
+const EMPTY_SPAN_RETRY_MS = 24 * 60 * 60 * 1000;
 
 class DrakeFactotumPlugin extends obsidian.Plugin {
     async onload() {
         await this.loadSettings();
-        this.addSettingTab(new FactotumSettingTab(this.app, this));
+        this.settingTab = new FactotumSettingTab(this.app, this);
+        this.addSettingTab(this.settingTab);
         this.sweepRunning = false;
         this.syncSettling = null;
         this.jobRunning = {};   // job id → true while its run is in flight
         this.jobRetryAt = {};   // job id → wall-clock ms before which a failed run isn't retried
         this.jobRetryMs = {};   // job id → current backoff, 0 once the period is stamped
+        this.jobRetryFor = {};  // job id → the period its backoff belongs to
+        this.bailNoticed = {};  // cause → true once an automatic run has raised it as a Notice
+        this.reviewRunning = {};        // review note path → true while it is being generated
+        this.sweepParseFailures = {};   // daystamp → unusable replies received for that day
+        this.vaultActivity = null;      // called on any vault file event while waitForSyncSettled() listens
+        for (const ev of ['create', 'modify', 'delete', 'rename']) {
+            this.registerEvent(this.app.vault.on(ev, () => { if (this.vaultActivity) this.vaultActivity(); }));
+        }
         this.setupScrollOff();
         this.app.workspace.onLayoutReady(() => {
             // Catch up on whatever closed while the app was shut (the nightly
@@ -2284,8 +2522,8 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                         : 'Factotum: no items to classify.');
                     return;
                 }
-                new RankSessionModal(this.app, parsed, (result, partial) => {
-                    applyResult(editor, content, result);
+                new RankSessionModal(this.app, parsed, async (result, partial) => {
+                    if (!await this.saveResult(editorTarget(editor), content, parsed, result)) return;
                     new obsidian.Notice(partial
                         ? 'Factotum: session interrupted — progress saved; run again to finish.'
                         : 'Factotum: rankings saved ✓');
@@ -2314,12 +2552,12 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                         new obsidian.Notice('Factotum: open a note, or set a TODO note path in settings.');
                         return;
                     }
-                    target = { read: async () => view.editor.getValue(), write: async (c) => view.editor.setValue(c) };
+                    target = editorTarget(view.editor);
                 }
                 const content = await target.read();
                 const parsed  = parseNote(content);
                 new AddItemModal(this.app, parsed, async (result, partial) => {
-                    await target.write(computeResult(content, result));
+                    if (!await this.saveResult(target, content, parsed, result)) return;
                     new obsidian.Notice(partial
                         ? 'Factotum: interrupted — item saved with best-effort placement ✓'
                         : 'Factotum: item added ✓');
@@ -2338,8 +2576,8 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                     new obsidian.Notice('Factotum: no items under an "Inbox" heading in this note.');
                     return;
                 }
-                new TriageInboxModal(this.app, parsed, (result, partial) => {
-                    applyResult(editor, content, result);
+                new TriageInboxModal(this.app, parsed, async (result, partial) => {
+                    if (!await this.saveResult(editorTarget(editor), content, parsed, result)) return;
                     if (partial) {
                         const left = (result.mode === 'flat' ? result.inbox : result.sections.inbox).length;
                         new obsidian.Notice(`Factotum: triage interrupted — placed items saved, ${left} still in the Inbox.`);
@@ -2366,8 +2604,8 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                     new obsidian.Notice('Factotum: no items to prioritize.');
                     return;
                 }
-                new ClaudePrioritizeModal(this.app, parsed, { apiKey: this.anthropicApiKey(), model: this.settings.anthropic.model }, (result) => {
-                    applyResult(editor, content, result);
+                new ClaudePrioritizeModal(this.app, parsed, { apiKey: this.anthropicApiKey(), model: this.settings.anthropic.model }, async (result) => {
+                    if (!await this.saveResult(editorTarget(editor), content, parsed, result)) return;
                     new obsidian.Notice('Factotum: Claude\'s prioritization saved ✓');
                 }).open();
             }
@@ -2411,8 +2649,8 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                     new obsidian.Notice('Factotum: no items to classify.');
                     return;
                 }
-                new ConvertModal(this.app, parsed, (result, partial) => {
-                    applyResult(editor, content, result);
+                new ConvertModal(this.app, parsed, async (result, partial) => {
+                    if (!await this.saveResult(editorTarget(editor), content, parsed, result)) return;
                     new obsidian.Notice(partial
                         ? 'Factotum: conversion interrupted — classified items placed; the rest are in the Inbox.'
                         : 'Factotum: converted to Eisenhower matrix ✓');
@@ -2502,29 +2740,116 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         workspace.revealLeaf(leaf);
     }
 
-    async loadSettings() {
-        const data = await this.loadData();
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
-        this.settings.beeminder = Object.assign({}, DEFAULT_SETTINGS.beeminder, data?.beeminder);
-        this.settings.reflectionFeed = Object.assign({}, DEFAULT_SETTINGS.reflectionFeed, data?.reflectionFeed);
-        this.settings.anthropic = Object.assign({}, DEFAULT_SETTINGS.anthropic, data?.anthropic);
-        this.settings.dailySweep = Object.assign({}, DEFAULT_SETTINGS.dailySweep, data?.dailySweep);
-        this.settings.weeklyReview = Object.assign({}, DEFAULT_SETTINGS.weeklyReview, data?.weeklyReview);
-        this.settings.monthlyReview = Object.assign({}, DEFAULT_SETTINGS.monthlyReview, data?.monthlyReview);
-        this.settings.quarterlyReview = Object.assign({}, DEFAULT_SETTINGS.quarterlyReview, data?.quarterlyReview);
-        this.settings.yearlyReview = Object.assign({}, DEFAULT_SETTINGS.yearlyReview, data?.yearlyReview);
-        this.settings.decadeReview = Object.assign({}, DEFAULT_SETTINGS.decadeReview, data?.decadeReview);
-        this.settings.centuryReview = Object.assign({}, DEFAULT_SETTINGS.centuryReview, data?.centuryReview);
+    // data.json's contents laid over the defaults, as a fresh settings object.
+    settingsFromData(data) {
+        const settings = Object.assign({}, DEFAULT_SETTINGS, data);
+        settings.beeminder = Object.assign({}, DEFAULT_SETTINGS.beeminder, data?.beeminder);
+        settings.reflectionFeed = Object.assign({}, DEFAULT_SETTINGS.reflectionFeed, data?.reflectionFeed);
+        settings.anthropic = Object.assign({}, DEFAULT_SETTINGS.anthropic, data?.anthropic);
+        settings.dailySweep = Object.assign({}, DEFAULT_SETTINGS.dailySweep, data?.dailySweep);
+        settings.weeklyReview = Object.assign({}, DEFAULT_SETTINGS.weeklyReview, data?.weeklyReview);
+        settings.monthlyReview = Object.assign({}, DEFAULT_SETTINGS.monthlyReview, data?.monthlyReview);
+        settings.quarterlyReview = Object.assign({}, DEFAULT_SETTINGS.quarterlyReview, data?.quarterlyReview);
+        settings.yearlyReview = Object.assign({}, DEFAULT_SETTINGS.yearlyReview, data?.yearlyReview);
+        settings.decadeReview = Object.assign({}, DEFAULT_SETTINGS.decadeReview, data?.decadeReview);
+        settings.centuryReview = Object.assign({}, DEFAULT_SETTINGS.centuryReview, data?.centuryReview);
         // The API key/model used to live under weeklyReview; they're now shared
         // with the monthly review. Migrate old data forward, then drop the old
         // fields so the next save leaves a single copy of the key.
-        if (!this.settings.anthropic.apiKey && data?.weeklyReview?.apiKey) {
-            this.settings.anthropic.apiKey = data.weeklyReview.apiKey;
-            if (data.weeklyReview.model) this.settings.anthropic.model = data.weeklyReview.model;
+        if (!settings.anthropic.apiKey && data?.weeklyReview?.apiKey) {
+            settings.anthropic.apiKey = data.weeklyReview.apiKey;
+            if (data.weeklyReview.model) settings.anthropic.model = data.weeklyReview.model;
         }
-        delete this.settings.weeklyReview.apiKey;
-        delete this.settings.weeklyReview.model;
+        delete settings.weeklyReview.apiKey;
+        delete settings.weeklyReview.model;
+        const pending = settings.dailySweep.pendingDays;
+        settings.dailySweep.pendingDays = Array.isArray(pending) ? [...pending] : [];
+        return settings;
+    }
 
+    async loadSettings() {
+        this.settings = this.settingsFromData(await this.loadData());
+        await this.moveSecretsToKeychain();
+    }
+
+    // Obsidian calls this when data.json changes underneath the plugin — in
+    // practice Obsidian Sync delivering another device's save. Without it the
+    // settings read at load go stale, and this device's next save (which
+    // writes the whole object) puts them back over the other device's stamps
+    // and edits.
+    //
+    // The file's values are merged into the existing objects rather than
+    // replacing them: a run in flight and the settings tab both hold
+    // references to the sub-objects, and a stamp written through a replaced
+    // one would never reach the next save. Changes are applied one at a
+    // time, in the order they arrive.
+    onExternalSettingsChange() {
+        this.externalChange = (this.externalChange || Promise.resolve())
+            .then(() => this.applyExternalSettings())
+            .catch(e => console.error('Factotum — could not reload settings after an external change', e));
+        return this.externalChange;
+    }
+
+    async applyExternalSettings() {
+        const data = await this.loadData();
+        // A deleted or empty data.json is not a request to reset everything
+        // to defaults — keep what is in memory; the next save restores it.
+        if (!data || typeof data !== 'object') return;
+        const incoming = this.settingsFromData(data);
+
+        // Done-markers: the file may come from a device that was itself
+        // stale, so it must not undo a period this device has finished. A
+        // job is done when its stamp names the period that last closed, so
+        // that is the stamp to hold on to; anything else gives way to the
+        // file. The daily jobs compare their stamps by order, so there the
+        // later one wins.
+        const keepIfClosed = (key, field, closedStamp) => {
+            if (this.settings[key][field] === closedStamp) incoming[key][field] = closedStamp;
+        };
+        if (this.settings.beeminder.lastSubmittedDaystamp > incoming.beeminder.lastSubmittedDaystamp) {
+            incoming.beeminder.lastSubmittedDaystamp = this.settings.beeminder.lastSubmittedDaystamp;
+        }
+        for (const kind of Object.keys(REVIEW_KINDS)) {
+            const k = REVIEW_KINDS[kind];
+            keepIfClosed(k.settingsKey, k.stampField, periodStampOf(k, this.lastClosedReviewTarget(kind)));
+        }
+        if (this.settings.dailySweep.lastSweptDaystamp > incoming.dailySweep.lastSweptDaystamp) {
+            incoming.dailySweep.lastSweptDaystamp = this.settings.dailySweep.lastSweptDaystamp;
+        }
+
+        // Secrets. A device with a keychain saves these fields blank; a
+        // device still holding one in plaintext (no keychain, or a move into
+        // it that failed) keeps its copy and writes it back, so it survives
+        // a restart. A plaintext value arriving from another device is left
+        // where it is — never moved into this device's keychain, whose own
+        // entry readSecret() prefers.
+        let restored = false;
+        for (const [key, field] of [['anthropic', 'apiKey'], ['beeminder', 'authToken']]) {
+            if (!incoming[key][field] && this.settings[key][field]) {
+                incoming[key][field] = this.settings[key][field];
+                restored = true;
+            }
+        }
+
+        for (const key of Object.keys(incoming)) {
+            const cur = this.settings[key];
+            const next = incoming[key];
+            if (cur && next && typeof cur === 'object' && typeof next === 'object') {
+                for (const field of Object.keys(cur)) {
+                    if (!(field in next)) delete cur[field];
+                }
+                Object.assign(cur, next);
+            } else {
+                this.settings[key] = next;
+            }
+        }
+        if (restored) await this.saveSettings();
+        // An open settings tab would otherwise go on showing the old values.
+        if (this.settingTab?.containerEl?.isShown?.()) this.settingTab.display();
+        console.log('Factotum — settings reloaded after an external change to data.json');
+    }
+
+    async moveSecretsToKeychain() {
         // Move any plaintext secrets into the keychain, then drop them from
         // data.json. Runs once per device; a later load finds the fields blank.
         const ss = secretStore(this.app);
@@ -2532,6 +2857,10 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             let moved = false;
             const move = (obj, field, id) => {
                 if (!obj[field]) return;
+                // A key already in this device's keychain is this device's
+                // own; plaintext arriving in a synced data.json belongs to a
+                // device without a keychain and is left for it.
+                if (ss.getSecret(id)) return;
                 try {
                     ss.setSecret(id, obj[field]);
                     obj[field] = '';
@@ -2575,10 +2904,15 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         if (ss) {
             if (value) ss.setSecret(id, value);
             else if (typeof ss.deleteSecret === 'function') ss.deleteSecret(id);
+            else ss.setSecret(id, '');   // readSecret() treats blank as absent
             legacyObj[legacyField] = '';
         } else {
             legacyObj[legacyField] = value;
         }
+        // A changed key or token may be missing again later; let that be
+        // raised afresh. Jobs backing off for want of it may try again now.
+        this.bailNoticed = {};
+        this.jobRetryAt = {};
         await this.saveSettings();
     }
 
@@ -2586,13 +2920,40 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     // TFile, tolerating a missing ".md". Returns null if there is no path or
     // it doesn't point at a markdown file.
     resolveTodoNote(fallback = '') {
-        const path = (this.settings.todoNotePath || '').trim() || fallback;
-        if (!path) return null;
+        const raw = ((this.settings.todoNotePath || '').trim() || fallback).replace(/^\/+/, '');
+        if (!raw) return null;
+        const path = obsidian.normalizePath(raw);
+        // "TODO" may name a folder that sits beside TODO.md.
         let file = this.app.vault.getAbstractFileByPath(path);
-        if (!file && !path.toLowerCase().endsWith('.md')) {
+        if (!(file instanceof obsidian.TFile) && !path.toLowerCase().endsWith('.md')) {
             file = this.app.vault.getAbstractFileByPath(path + '.md');
         }
         return file instanceof obsidian.TFile ? file : null;
+    }
+
+    // Write a session's result to the note it was run on. `snapshot` is the
+    // note as the session saw it (and `parsed` its parse); if the note has
+    // changed since, the result is carried over to it as it is now — see
+    // rebaseResult(). Returns whether anything was written; a failure is
+    // reported here.
+    async saveResult(target, snapshot, parsed, result) {
+        try {
+            const latest = await target.read();
+            let final = result;
+            if (latest !== snapshot) {
+                final = rebaseResult(result, parsed, parseNote(latest));
+                if (!final) {
+                    new obsidian.Notice('Factotum: the note was restructured while the session was open — nothing was saved. Run it again.');
+                    return false;
+                }
+            }
+            await target.write(computeResult(latest, final));
+            return true;
+        } catch (e) {
+            console.error('Factotum — could not save to the note', e);
+            new obsidian.Notice('Factotum: could not save to the note.');
+            return false;
+        }
     }
 
     // The open editor for a file, if any leaf currently has it loaded.
@@ -2606,14 +2967,19 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
 
     // A read/write handle for a file. If it's open in an editor, go through the
     // editor so unsaved changes aren't clobbered; otherwise touch the file.
+    // Which of the two is decided at each read and write, since the note may
+    // be opened or closed in between.
     fileTarget(file) {
-        const editor = this.findOpenEditor(file);
-        if (editor) {
-            return { read: async () => editor.getValue(), write: async (c) => editor.setValue(c) };
-        }
         return {
-            read: () => this.app.vault.read(file),
-            write: (c) => this.app.vault.modify(file, c),
+            read: async () => {
+                const editor = this.findOpenEditor(file);
+                return editor ? editor.getValue() : this.app.vault.read(file);
+            },
+            write: async (c) => {
+                const editor = this.findOpenEditor(file);
+                if (editor) editor.setValue(c);
+                else await this.app.vault.modify(file, c);
+            },
         };
     }
 
@@ -2654,26 +3020,34 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     // `target` is the last day of the period that most recently closed (what
     // the run functions expect), `done` whether that period is already
     // stamped, `run` the scheduled run for it, and `catchUp` the wider
-    // walk-back used once on open.
+    // walk-back used once on open. `key` names the job's current period,
+    // so a backoff earned by one period isn't carried into the next.
+    //
+    // The daily jobs read notes another device may have written to since
+    // this one last synced, so their runs wait for sync to settle first —
+    // a stale daily note would overwrite a correct Beeminder count.
     scheduledJobs() {
         const day = this.lastClosedDay();
         const daystamp = day.format('YYYYMMDD');
         const jobs = [
-            { id: 'beeminder', period: 'day', target: day,
+            { id: 'beeminder', period: 'day', target: day, key: daystamp,
               enabled: this.settings.beeminder.enabled,
-              done: this.settings.beeminder.lastSubmittedDaystamp === daystamp,
-              run: (t, reason) => this.runBeeminderSubmission(reason, t),
+              done: this.settings.beeminder.lastSubmittedDaystamp >= daystamp,
+              run: async (t, reason) => {
+                  await this.waitForSyncSettled();
+                  return this.runBeeminderSubmission(reason, t);
+              },
               catchUp: () => this.maybeCatchUpBeeminder() },
-            { id: 'sweep', period: 'day', target: day,
+            { id: 'sweep', period: 'day', target: day, key: daystamp,
               enabled: this.settings.dailySweep.enabled,
-              done: this.settings.dailySweep.lastSweptDaystamp >= daystamp,
-              run: (t, reason) => this.runDailySweep(reason, t),
-              catchUp: () => this.maybeCatchUpDailySweep() },
+              done: this.outstandingSweepDays().length === 0,
+              run: (t, reason) => this.sweepOutstanding(reason),
+              catchUp: () => this.sweepOutstanding('catch-up on open') },
         ];
         for (const kind of Object.keys(REVIEW_KINDS)) {
             const k = REVIEW_KINDS[kind];
             const target = this.lastClosedReviewTarget(kind);
-            jobs.push({ id: `review:${kind}`, period: kind, target,
+            jobs.push({ id: `review:${kind}`, period: kind, target, key: periodStampOf(k, target),
                         enabled: this.settings[k.settingsKey].enabled,
                         done: this.settings[k.settingsKey][k.stampField] === periodStampOf(k, target),
                         run: (t, reason) => this.generateReview(kind, reason, t),
@@ -2690,6 +3064,11 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         for (const job of this.scheduledJobs()) {
             if (!job.enabled || this.jobRunning[job.id]) continue;
             if (job.done) { this.jobRetryMs[job.id] = 0; continue; }
+            if (this.jobRetryFor[job.id] !== job.key) {
+                // A new period has closed since the last attempt.
+                this.jobRetryMs[job.id] = 0;
+                this.jobRetryAt[job.id] = 0;
+            }
             if ((this.jobRetryAt[job.id] || 0) > now) continue;
             this.runJob(job, `scheduled ${job.period}-close 12AM`, (reason) => job.run(job.target, reason));
         }
@@ -2697,13 +3076,15 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
 
     // Run one job exclusively, then decide whether it needs another go: if
     // its period is still not stamped afterwards, back off (5 minutes,
-    // doubling to an hour) before the tick tries again. Errors are logged,
+    // doubling to an hour) before the tick tries again. A run may ask for a
+    // longer wait of its own by returning { retryIn }. Errors are logged,
     // never thrown — a failing job must not take the tick down with it.
     async runJob(job, reason, fn) {
         if (this.jobRunning[job.id]) return;
         this.jobRunning[job.id] = true;
+        let outcome;
         try {
-            await fn(reason);
+            outcome = await fn(reason);
         } catch (e) {
             console.error(`Factotum — ${job.id} failed [${reason}]`, e);
         } finally {
@@ -2714,10 +3095,34 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             this.jobRetryMs[job.id] = 0;
             return;
         }
-        const wait = Math.min(Math.max(this.jobRetryMs[job.id] * 2 || 0, RETRY_MIN_MS), RETRY_MAX_MS);
-        this.jobRetryMs[job.id] = wait;
+        const backoff = Math.min(Math.max(this.jobRetryMs[job.id] * 2 || 0, RETRY_MIN_MS), RETRY_MAX_MS);
+        const wait = outcome?.retryIn || backoff;
+        this.jobRetryMs[job.id] = backoff;
         this.jobRetryAt[job.id] = Date.now() + wait;
+        this.jobRetryFor[job.id] = after.key;
         console.log(`Factotum — ${job.id} did not complete [${reason}]; retrying in ${Math.round(wait / 60000)} min`);
+    }
+
+    // A run that gives up before doing any work says why: a manual run in a
+    // Notice, an automatic one in the console, where the retry line that
+    // follows it would otherwise be the only trace. `once` marks a cause
+    // only the user can fix (a missing key or token) — an automatic run
+    // raises that as a Notice too, once per session rather than per retry.
+    // `routine` marks a skip the catch-up walk-back makes as a matter of
+    // course (a day with no note); it is logged at debug level so a week of
+    // them doesn't bury the lines that matter.
+    bail(what, reason, why, notify, once = '', routine = false) {
+        if (notify) {
+            new obsidian.Notice(`Factotum: ${why}`);
+            return;
+        }
+        const line = `Factotum — ${what} skipped [${reason}]: ${why}`;
+        if (routine) console.debug(line);
+        else console.warn(line);
+        if (!once) return;
+        if (this.bailNoticed[once]) return;
+        this.bailNoticed[once] = true;
+        new obsidian.Notice(`Factotum: ${why}`, 15000);
     }
 
     // If a midnight submission was missed (Obsidian closed at the time), catch
@@ -2731,23 +3136,29 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         // exists; runBeeminderSubmission() skips days with no note (no clobber),
         // and the stable per-day requestid makes re-sending an unchanged day a
         // harmless overwrite — so this also self-heals notes that sync in late.
-        // Oldest-first so lastSubmittedDaystamp ends at the most recent day.
+        // The notes are read once sync has settled: a copy another device
+        // has since added to would send a stale count over the right one.
+        await this.waitForSyncSettled();
+        if (!this.settings.beeminder.enabled) return;
         for (let i = 6; i >= 0; i--) {
             await this.runBeeminderSubmission('catch-up on open', mostRecent.clone().subtract(i, 'day'));
         }
     }
 
+    // Scheduled and catch-up runs pass the day and stamp it; "Send now" (no
+    // day → today) is the user trying their setup — it runs whether or not
+    // the nightly submission is switched on, and leaves the stamp alone.
     async runBeeminderSubmission(reason, targetMoment = null, notify = false) {
         const s = this.settings.beeminder;
-        if (!s.enabled) return;
+        if (!s.enabled && !notify) return;
         const authToken = this.beeminderAuthToken();
         if (!authToken || !s.username || !s.goalName) {
-            if (notify) new obsidian.Notice('Factotum: Beeminder not configured (token, user, and goal required).');
+            this.bail('Beeminder submission', reason, 'Beeminder not configured (token, user, and goal required).', notify, 'beeminder-config');
             return;
         }
         const config = getDailyNoteConfig(this.app);
         if (!config) {
-            if (notify) new obsidian.Notice('Factotum: could not find a Daily Notes / Periodic Notes config.');
+            this.bail('Beeminder submission', reason, 'could not find a Daily Notes / Periodic Notes config.', notify);
             return;
         }
         const day = targetMoment || obsidian.moment();
@@ -2762,7 +3173,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const notePath = dailyNotePath(config, day);
         const noteFile = this.app.vault.getAbstractFileByPath(notePath);
         if (!(noteFile instanceof obsidian.TFile)) {
-            if (notify) new obsidian.Notice(`Factotum: no daily note for ${day.format('YYYY-MM-DD')} yet — nothing sent.`);
+            this.bail('Beeminder submission', reason, `no daily note for ${day.format('YYYY-MM-DD')} yet — nothing sent.`, notify, '', true);
             return;
         }
         const noteWords = countWords(await this.app.vault.cachedRead(noteFile));
@@ -2775,8 +3186,12 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         try {
             const res = await submitToBeeminder(s, authToken, value, daystamp, comment);
             if (res.status >= 200 && res.status < 300) {
-                s.lastSubmittedDaystamp = daystamp;
-                await this.saveSettings();
+                // The stamp only moves forward: the catch-up's re-sends of
+                // earlier days must not pull it back.
+                if (targetMoment && daystamp > s.lastSubmittedDaystamp) {
+                    s.lastSubmittedDaystamp = daystamp;
+                    await this.saveSettings();
+                }
                 if (notify) new obsidian.Notice(`Factotum: sent ${value} words to Beeminder ✓`);
             } else {
                 // Background runs stay silent (they retry on the next open/timer);
@@ -2790,25 +3205,37 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         }
     }
 
-    // If a midnight sweep was missed (Obsidian closed, or a phone whose timers
-    // never fired), catch up on open: every day since the last one swept,
-    // up to a week back, oldest first. On first enable only the most recent
-    // night is swept — nothing older gets dragged in. Days whose note is
-    // missing are skipped without a stamp, so a note that syncs in late is
-    // picked up by a later open. Each day is one Claude call, so this waits
-    // for sync to settle first — another device may have swept already, and
-    // the TODO note it wrote to should land before this one writes.
-    async maybeCatchUpDailySweep() {
+    // The days the sweep still owes, oldest first: every day since the last
+    // one swept, up to a week back, plus any day in that week passed over
+    // because its note wasn't there (`pendingDays`) — so a note that syncs
+    // in late is still swept after later days have been. On first enable
+    // only the most recent night counts — nothing older gets dragged in.
+    outstandingSweepDays() {
         const s = this.settings.dailySweep;
-        if (!s.enabled) return;
         const mostRecent = this.lastClosedDay();
         const back = s.lastSweptDaystamp ? 6 : 0;
-        await this.waitForSyncSettled();
-        if (!s.enabled) return;
+        const days = [];
         for (let i = back; i >= 0; i--) {
             const day = mostRecent.clone().subtract(i, 'day');
-            if (day.format('YYYYMMDD') <= s.lastSweptDaystamp) continue;
-            await this.runDailySweep('catch-up on open', day);
+            const daystamp = day.format('YYYYMMDD');
+            if (daystamp > s.lastSweptDaystamp || s.pendingDays.includes(daystamp)) days.push(day);
+        }
+        return days;
+    }
+
+    // Sweep every outstanding day — at midnight that is the day that just
+    // closed; after a missed midnight (Obsidian closed, or a phone whose
+    // timers never fired) it is each night since. Each day is one Claude
+    // call, so this waits for sync to settle first — another device may
+    // have swept already, and the TODO note it wrote to should land before
+    // this one reads it.
+    async sweepOutstanding(reason) {
+        const s = this.settings.dailySweep;
+        if (!s.enabled) return;
+        await this.waitForSyncSettled();
+        if (!s.enabled) return;
+        for (const day of this.outstandingSweepDays()) {
+            await this.runDailySweep(reason, day);
         }
     }
 
@@ -2834,29 +3261,39 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const s = this.settings.dailySweep;
         const apiKey = this.anthropicApiKey();
         if (!apiKey) {
-            if (notify) new obsidian.Notice('Factotum: the daily sweep needs an Anthropic API key.');
+            this.bail('daily sweep', reason, 'the daily sweep needs an Anthropic API key.', notify, 'anthropic-key');
             return;
         }
         const todoFile = this.resolveTodoNote(SWEEP_DEFAULT_TODO_PATH);
         if (!todoFile) {
-            if (notify) new obsidian.Notice(`Factotum: no TODO note — set a TODO note path in settings, or create ${SWEEP_DEFAULT_TODO_PATH}.`);
+            this.bail('daily sweep', reason, `no TODO note — set a TODO note path in settings, or create ${SWEEP_DEFAULT_TODO_PATH}.`, notify);
             return;
         }
         const config = getDailyNoteConfig(this.app);
         if (!config) {
-            if (notify) new obsidian.Notice('Factotum: could not find a Daily Notes / Periodic Notes config.');
+            this.bail('daily sweep', reason, 'could not find a Daily Notes / Periodic Notes config.', notify);
             return;
         }
         const day = targetMoment || obsidian.moment();
         const daystamp = day.format('YYYYMMDD');
+        const weekAgo = this.lastClosedDay().subtract(6, 'day').format('YYYYMMDD');
         const stamp = async () => {
-            if (!targetMoment || daystamp <= s.lastSweptDaystamp) return;
-            s.lastSweptDaystamp = daystamp;
+            if (!targetMoment) return;
+            const pending = s.pendingDays.filter(d => d !== daystamp && d >= weekAgo);
+            if (pending.length === s.pendingDays.length && daystamp <= s.lastSweptDaystamp) return;
+            s.pendingDays = pending;
+            if (daystamp > s.lastSweptDaystamp) s.lastSweptDaystamp = daystamp;
             await this.saveSettings();
         };
         const noteFile = this.app.vault.getAbstractFileByPath(dailyNotePath(config, day));
         if (!(noteFile instanceof obsidian.TFile)) {
-            if (notify) new obsidian.Notice(`Factotum: no daily note for ${day.format('YYYY-MM-DD')} yet — nothing to sweep.`);
+            this.bail('daily sweep', reason, `no daily note for ${day.format('YYYY-MM-DD')} yet — nothing to sweep.`, notify, '', true);
+            // Remembered, so the day is still swept if its note turns up
+            // after later days have been stamped.
+            if (targetMoment && s.lastSweptDaystamp && !s.pendingDays.includes(daystamp)) {
+                s.pendingDays = [...s.pendingDays.filter(d => d >= weekAgo), daystamp];
+                await this.saveSettings();
+            }
             return;
         }
         const noteText = await this.app.vault.cachedRead(noteFile);
@@ -2868,6 +3305,9 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             return;
         }
 
+        // The handle decides between the open editor and the file at each
+        // read and write, so opening or closing the TODO note during the
+        // call doesn't send the write to the wrong one.
         const target = this.fileTarget(todoFile);
         const todoBefore = await target.read();
         const MAX_TODO_CHARS = 60000;
@@ -2891,18 +3331,27 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             console.error('Factotum — daily sweep API error', res.status);
             return;
         }
-        const found = parseSweepItems(res.text);
+        const found = res.truncated ? null : parseSweepItems(res.text);
         if (!found) {
             if (notify) new obsidian.Notice('Factotum: Claude\'s sweep response couldn\'t be parsed.');
-            console.error('Factotum — unparseable sweep response', res.text);
+            console.error(`Factotum — ${res.truncated ? 'truncated' : 'unparseable'} sweep response`, res.text);
+            // A note Claude won't or can't answer for gets the same reply
+            // on every retry; after a few, let the day go rather than
+            // paying for the call every hour.
+            const failures = (this.sweepParseFailures[daystamp] || 0) + 1;
+            this.sweepParseFailures[daystamp] = failures;
+            if (targetMoment && failures >= SWEEP_MAX_PARSE_FAILURES) {
+                console.warn(`Factotum — giving up on the sweep of ${day.format('YYYY-MM-DD')} after ${failures} unusable replies`);
+                await stamp();
+            }
             return;
         }
 
         // The call takes a while; re-read so an edit made meanwhile isn't
-        // clobbered, and drop anything now literally present in the note.
+        // clobbered, and drop anything that is already an item in the note.
         const todoNow = await target.read();
-        const haystack = todoNow.toLowerCase();
-        const fresh = found.filter(t => !haystack.includes(t.toLowerCase()));
+        const have = new Set(todoNow.split('\n').map(sweepKey));
+        const fresh = found.filter(t => !have.has(sweepKey(t)));
         if (fresh.length === 0) {
             if (notify) new obsidian.Notice(`Factotum: no new to-dos in ${day.format('YYYY-MM-DD')}'s note.`);
             await stamp();
@@ -2932,13 +3381,10 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         this.syncSettling = new Promise((resolve) => {
             let quietTimer = null;
             let capTimer = null;
-            const refs = ['create', 'modify', 'delete', 'rename']
-                .map(ev => this.app.vault.on(ev, () => armQuiet()));
-            refs.forEach(r => this.registerEvent(r));
             const finish = () => {
                 window.clearTimeout(quietTimer);
                 window.clearTimeout(capTimer);
-                refs.forEach(r => this.app.vault.offref(r));
+                this.vaultActivity = null;
                 this.syncSettling = null;
                 resolve();
             };
@@ -2959,6 +3405,8 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 window.clearTimeout(quietTimer);
                 quietTimer = window.setTimeout(() => syncBusy() ? armQuiet() : finish(), QUIET_MS);
             };
+            // The vault listeners themselves are registered once, in onload.
+            this.vaultActivity = armQuiet;
             capTimer = window.setTimeout(finish, MAX_WAIT_MS);
             armQuiet();
         });
@@ -2970,13 +3418,13 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     // For long spans this reaches far back: enabling the decade review in 2026
     // targets the 2010s — same semantics as enabling yearly mid-year. A span
     // with no source notes writes nothing and sets no stamp, so it re-scans
-    // (cheaply) each startup until notes exist.
+    // (cheaply) until notes exist.
     async maybeCatchUpReview(kind) {
         const k = REVIEW_KINDS[kind];
         if (!this.settings[k.settingsKey].enabled) return;
         const target = this.lastClosedReviewTarget(kind);
         if (this.settings[k.settingsKey][k.stampField] !== periodStampOf(k, target)) {
-            await this.generateReview(kind, 'catch-up on open', target);
+            return this.generateReview(kind, 'catch-up on open', target);
         }
     }
 
@@ -2999,7 +3447,9 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     // period whose review note doesn't exist drops out of the input — the
     // finer notes it replaced no longer fit anyway. Boundary periods are
     // included whole (the ISO week holding a decade's Jan 1 reaches a few
-    // days into the prior decade — harmless, and simpler than clipping).
+    // days into the prior decade, and a week straddling two months is read
+    // alongside the first month's review — harmless, and simpler than
+    // clipping).
     // `sections` is empty if no source notes exist at any granularity.
     async collectLadderSections(kind, config, spanStart, lastDay) {
         const k = REVIEW_KINDS[kind];
@@ -3016,7 +3466,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             while (d.isSameOrBefore(last)) {
                 const file = this.app.vault.getAbstractFileByPath(dailyNotePath(config, d));
                 if (file instanceof obsidian.TFile) {
-                    entries.push({ rung: 'day', start: d.clone(), file, est: file.stat.size + 40 });
+                    entries.push({ rung: 'day', start: d.clone(), end: d.clone().add(1, 'day'), file, est: file.stat.size + 40 });
                 }
                 d.add(1, 'day');
             }
@@ -3043,21 +3493,28 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             // Don't let the target period reach before the span, or back into
             // territory the previous (coarser) entry already covers.
             let floor = spanStart;
-            if (i > 0) {
-                const prevEnd = addPeriods(REVIEW_KINDS[entries[i - 1].rung], entries[i - 1].start, 1);
-                if (prevEnd.isAfter(floor)) floor = prevEnd;
-            }
+            if (i > 0 && entries[i - 1].end.isAfter(floor)) floor = entries[i - 1].end;
             const anchor = head.start.isBefore(floor) ? floor : head.start;
             const P = periodStart(nk, anchor);
             const Pend = addPeriods(nk, P, 1);
-            while (entries.length > i && entries[i].start.isBefore(Pend)) {
-                total -= entries[i].est;
-                entries.splice(i, 1);
+            // Entries that end inside the period give way to its review. One
+            // that runs on past the period's end (a week straddling two
+            // months) stays for the days beyond it, counted from there on —
+            // the next pass folds it into the following period.
+            let j = i;
+            while (j < entries.length && entries[j].start.isBefore(Pend)) {
+                if (entries[j].end.isAfter(Pend)) {
+                    entries[j].start = Pend.clone();
+                    j++;
+                } else {
+                    total -= entries[j].est;
+                    entries.splice(j, 1);
+                }
             }
             const stamp = periodStampOf(nk, P);
             const file = this.app.vault.getAbstractFileByPath(reviewNotePath(this.settings[nk.settingsKey].folder, stamp));
             if (file instanceof obsidian.TFile) {
-                const e = { rung: rungs[fi + 1], start: P, stamp, file, est: file.stat.size + 40 };
+                const e = { rung: rungs[fi + 1], start: P, end: Pend, stamp, file, est: file.stat.size + 40 };
                 entries.splice(i, 0, e);
                 total += e.est;
             } else {
@@ -3102,10 +3559,40 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
     // `recordStamp: false` is for reviews of long-past periods: they must not
     // write their (old) stamp into the done-marker, which tracks the current
     // scheduling cycle.
+    //
+    // A review of a period that hasn't ended yet ("Generate now" mid-week)
+    // is a preview: it is written beside the period's note as
+    // "<stamp> (so far)" and never stamps, so the review at the period's
+    // close is still generated, under the period's own name.
+    //
+    // A manual run is the user asking — it goes ahead whether or not the
+    // scheduled review is switched on. One run per note at a time.
     async generateReview(kind, reason, lastDayMoment = null, notify = false, recordStamp = true) {
         const k = REVIEW_KINDS[kind];
         const s = this.settings[k.settingsKey];
-        if (!s.enabled) return;
+        if (!s.enabled && !notify) return;
+        const day = lastDayMoment || obsidian.moment();
+        const running = `${kind} ${periodStampOf(k, day)}`;
+        if (this.reviewRunning[running]) {
+            if (notify) new obsidian.Notice(`Factotum: the ${k.adjLabel} review for ${periodStampOf(k, day)} is already being generated.`);
+            return;
+        }
+        this.reviewRunning[running] = true;
+        try {
+            return await this.doGenerateReview(kind, reason, lastDayMoment, notify, recordStamp);
+        } catch (e) {
+            // An automatic run's failure is runJob's to log and retry.
+            if (!notify) throw e;
+            console.error(`Factotum — ${k.adjLabel} review failed [${reason}]`, e);
+            new obsidian.Notice(`Factotum: the ${k.adjLabel} review failed — see the console.`);
+        } finally {
+            this.reviewRunning[running] = false;
+        }
+    }
+
+    async doGenerateReview(kind, reason, lastDayMoment, notify, recordStamp) {
+        const k = REVIEW_KINDS[kind];
+        const s = this.settings[k.settingsKey];
         // Automatic runs (scheduled and catch-up) hold off until sync has
         // settled, so a review already written on another device can land
         // before the exists-check below looks for it. Manual runs are the
@@ -3115,12 +3602,12 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             if (!s.enabled) return; // may have been toggled off during the wait
         }
         if (!this.anthropicApiKey()) {
-            if (notify) new obsidian.Notice(`Factotum: the ${k.adjLabel} review needs an Anthropic API key.`);
+            this.bail(`${k.adjLabel} review`, reason, `the ${k.adjLabel} review needs an Anthropic API key.`, notify, 'anthropic-key');
             return;
         }
         const config = getDailyNoteConfig(this.app);
         if (!config) {
-            if (notify) new obsidian.Notice('Factotum: could not find a Daily Notes / Periodic Notes config.');
+            this.bail(`${k.adjLabel} review`, reason, 'could not find a Daily Notes / Periodic Notes config.', notify);
             return;
         }
 
@@ -3131,6 +3618,15 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         const stamp = periodStampOf(k, day);
         const spanStart = periodStart(k, day);
         const lastDay = day.clone().startOf('day');
+        const partial = lastDay.isBefore(addPeriods(k, spanStart, 1).subtract(1, 'day'));
+        const noteName = partial ? `${stamp} (so far)` : stamp;
+        // Set when another device's note for the period is found in place.
+        const alreadyWritten = async () => {
+            if (notify || !(this.app.vault.getAbstractFileByPath(reviewNotePath(s.folder, stamp)) instanceof obsidian.TFile)) return false;
+            s[k.stampField] = stamp;
+            await this.saveSettings();
+            return true;
+        };
 
         // The review note file is the durable, synced source of truth for
         // "this period is reviewed" — not the stamp field, which lives in
@@ -3139,11 +3635,7 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
         // over it: that note may have been written on another device and
         // synced here before this device's stamp caught up, and it may hold
         // notes the user added. Just record the period as done locally and stop.
-        if (!notify && this.app.vault.getAbstractFileByPath(reviewNotePath(s.folder, stamp)) instanceof obsidian.TFile) {
-            s[k.stampField] = stamp;
-            await this.saveSettings();
-            return;
-        }
+        if (await alreadyWritten()) return;
 
         const { sections, sourceLabel } = await this.collectLadderSections(kind, config, spanStart, lastDay);
 
@@ -3152,8 +3644,11 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             // yet (vault still indexing, or sync lag from another device).
             // Leaving the stamp unset lets a later open re-scan and review once
             // notes arrive.
-            if (notify) new obsidian.Notice(`Factotum: no source notes found for ${stamp}.`);
-            return;
+            this.bail(`${k.adjLabel} review`, reason, `no source notes found for ${stamp}.`, notify, '', !!k.yearsSpan);
+            // A decade or century with nothing written in it is the usual
+            // case, not a sync delay, and looking means walking every day
+            // of it — once a day is often enough.
+            return k.yearsSpan ? { retryIn: EMPTY_SPAN_RETRY_MS } : undefined;
         }
 
         // Read the goals section so Claude can pose a review question per goal.
@@ -3181,7 +3676,15 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
             console.error('Factotum — Claude API error', result.status);
             return;
         }
-        const reviewBody = result.text.trim();
+        // The call took a while — the other device's note may have landed.
+        if (await alreadyWritten()) return;
+        let reviewBody = result.text.trim();
+        if (result.truncated && reviewBody) {
+            // Asking again would run into the same limit; keep what there
+            // is and say so in the note.
+            console.warn(`Factotum — ${k.adjLabel} review for ${stamp} hit the output limit and is cut off`);
+            reviewBody += '\n\n> [!warning] This review reached the output limit and is cut off here.';
+        }
         if (!reviewBody) {
             // Empty/non-text response — don't write a hollow note or stamp the period.
             new obsidian.Notice('Factotum: Claude returned an empty response; no review written.');
@@ -3213,15 +3716,16 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 new obsidian.Notice(`Factotum: question list ${s.questionsSource} not found or empty; section omitted.`);
             }
         }
-        const note = `---\n${kind}: ${stamp}\nrange: ${range}\nsource: ${sourceLabel}\ngenerated: ${generated}\n---\n\n# ${k.title} — ${stamp}\n\n${embed}${reviewBody}${questionsSection}\n`;
+        const soFar = partial ? ' (so far)' : '';
+        const note = `---\n${kind}: ${stamp}\nrange: ${range}\n${partial ? 'partial: true\n' : ''}source: ${sourceLabel}\ngenerated: ${generated}\n---\n\n# ${k.title} — ${stamp}${soFar}\n\n${embed}${reviewBody}${questionsSection}\n`;
 
         try {
-            const file = await this.writeReviewNote(s.folder, stamp, note);
-            if (recordStamp) {
+            const file = await this.writeReviewNote(s.folder, noteName, note);
+            if (recordStamp && !partial) {
                 s[k.stampField] = stamp;
                 await this.saveSettings();
             }
-            new obsidian.Notice(`Factotum: ${k.adjLabel} review for ${stamp} saved ✓`);
+            new obsidian.Notice(`Factotum: ${k.adjLabel} review for ${stamp}${soFar} saved ✓`);
             if (notify && file) {
                 this.app.workspace.getLeaf(true).openFile(file)
                     .catch(e => console.error('Factotum — could not open review note', e));
@@ -3261,6 +3765,42 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
     constructor(app, plugin) {
         super(app, plugin);
         this.plugin = plugin;
+    }
+
+    // A field for a key or token. The stored value is never shown, so the
+    // field starts blank — and what is typed into it is only stored once
+    // the field is left or Enter is pressed, never keystroke by keystroke
+    // (a stray character would otherwise replace the secret on the spot).
+    // Leaving it blank changes nothing; removing the secret is the Clear
+    // button's job.
+    secretField(setting, { label, empty, read, store }) {
+        let field;
+        const refresh = () => {
+            field.setValue('');
+            field.setPlaceholder(read() ? '•••••••• (saved; paste to replace)' : empty);
+        };
+        setting.addText(t => {
+            field = t;
+            t.inputEl.type = 'password';
+            refresh();
+            t.inputEl.addEventListener('change', async () => {
+                const v = t.getValue().trim();
+                if (!v) return;
+                await store(v);
+                refresh();
+                new obsidian.Notice(`Factotum: ${label} saved.`);
+                this.plugin.tickSchedules();
+            });
+        });
+        setting.addExtraButton(btn => btn
+            .setIcon('trash')
+            .setTooltip(`Clear the saved ${label}`)
+            .onClick(async () => {
+                if (!read()) return;
+                await store('');
+                refresh();
+                new obsidian.Notice(`Factotum: ${label} cleared.`);
+            }));
     }
 
     display() {
@@ -3374,11 +3914,12 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
         new obsidian.Setting(containerEl)
             .setName('Beeminder auth token')
             .setDesc(`From beeminder.com/api/v1/auth_token.json (or your account settings). ${secretHomeDesc(this.app)}`)
-            .addText(t => {
-                t.setPlaceholder(this.plugin.beeminderAuthToken() ? '•••••••• (saved; paste to replace)' : 'auth token')
-                    .onChange(async (v) => { await this.plugin.storeSecret(SECRET_IDS.beeminderAuthToken, v.trim(), b, 'authToken'); });
-                t.inputEl.type = 'password';
-            });
+            .then(setting => this.secretField(setting, {
+                label: 'Beeminder auth token',
+                empty: 'auth token',
+                read: () => this.plugin.beeminderAuthToken(),
+                store: (v) => this.plugin.storeSecret(SECRET_IDS.beeminderAuthToken, v, b, 'authToken'),
+            }));
 
         new obsidian.Setting(containerEl)
             .setName('Beeminder username')
@@ -3424,11 +3965,12 @@ class FactotumSettingTab extends obsidian.PluginSettingTab {
         new obsidian.Setting(containerEl)
             .setName('Anthropic API key')
             .setDesc(`From console.anthropic.com. ${secretHomeDesc(this.app)}`)
-            .addText(t => {
-                t.setPlaceholder(this.plugin.anthropicApiKey() ? '•••••••• (saved; paste to replace)' : 'sk-ant-...')
-                    .onChange(async (v) => { await this.plugin.storeSecret(SECRET_IDS.anthropicApiKey, v.trim(), a, 'apiKey'); });
-                t.inputEl.type = 'password';
-            });
+            .then(setting => this.secretField(setting, {
+                label: 'Anthropic API key',
+                empty: 'sk-ant-...',
+                read: () => this.plugin.anthropicApiKey(),
+                store: (v) => this.plugin.storeSecret(SECRET_IDS.anthropicApiKey, v, a, 'apiKey'),
+            }));
 
         new obsidian.Setting(containerEl)
             .setName('Model')
