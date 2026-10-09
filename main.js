@@ -1056,6 +1056,10 @@ class AddItemModal extends obsidian.Modal {
 }
 
 // ── Triage inbox: classify & place each unprioritized item ──────────────────
+//
+// In a matrix note the triage then reviews Schedule (important, not urgent):
+// importance is already settled, so each item gets only the urgency question,
+// and anything that has become urgent moves up to Do.
 
 class TriageInboxModal extends obsidian.Modal {
     constructor(app, payload, onComplete) {
@@ -1073,6 +1077,11 @@ class TriageInboxModal extends obsidian.Modal {
             }
             this.sections.inbox = [];
         }
+        // Schedule items as they stood before triage — items the Inbox puts
+        // into Schedule this session were just classified, so aren't re-asked.
+        this.reviewQueue = payload.mode === 'flat' ? [] : [...payload.sections.Q2];
+        this.reviewIdx = 0;
+        this.promoted = new Set();
         this.idx = 0;
         this.placed = new Set();
         this.finished = false;
@@ -1092,7 +1101,7 @@ class TriageInboxModal extends obsidian.Modal {
             }
             this.estimatedTotal = Math.max(total, 1);
         } else {
-            this.estimatedTotal = Math.max(this.queue.length * 2, 1);
+            this.estimatedTotal = Math.max(this.queue.length * 2 + this.reviewQueue.length, 1);
         }
     }
 
@@ -1102,11 +1111,12 @@ class TriageInboxModal extends obsidian.Modal {
     }
 
     // Closing mid-triage keeps every fully placed item; the current item and
-    // anything not yet reached stay in the Inbox for a later session.
+    // anything not yet reached stay in the Inbox for a later session. Schedule
+    // items reviewed so far keep their answer; the rest stay in Schedule.
     onClose() {
         this.contentEl.empty();
         if (this.finished) return;
-        if (this.placed.size === 0) return;
+        if (this.placed.size === 0 && this.reviewIdx === 0) return;
         this.finished = true;
         const remaining = this.queue.slice(this.idx);
         if (this.payload.mode === 'flat') {
@@ -1118,6 +1128,7 @@ class TriageInboxModal extends obsidian.Modal {
 
     current() { return this.queue[this.idx]; }
     progressLabel() { return `Inbox item ${this.idx + 1} of ${this.queue.length}`; }
+    hasReview() { return this.reviewQueue.length > 0; }
 
     renderProgress(contentEl) {
         const prog = contentEl.createDiv({ cls: 'ordinal-progress' });
@@ -1131,7 +1142,7 @@ class TriageInboxModal extends obsidian.Modal {
     }
 
     nextItem() {
-        if (this.idx >= this.queue.length) { this.renderResults(); return; }
+        if (this.idx >= this.queue.length) { this.nextReview(); return; }
         if (this.payload.mode === 'flat') {
             this.targetQuadrant = null;
             this.startPlacement(this.items);
@@ -1189,6 +1200,41 @@ class TriageInboxModal extends obsidian.Modal {
         this.place(0);
     }
 
+    nextReview() {
+        if (this.reviewIdx >= this.reviewQueue.length) { this.renderResults(); return; }
+        const item = this.reviewQueue[this.reviewIdx];
+        const { contentEl } = this;
+        contentEl.empty();
+        this.decisionCount++;
+        contentEl.createDiv({
+            cls: 'ordinal-quadrant-label',
+            text: `Schedule item ${this.reviewIdx + 1} of ${this.reviewQueue.length}`
+        });
+        contentEl.createEl('h2', { text: item.text });
+        contentEl.createEl('p', { text: 'It\'s important — must it get done this week now?', cls: 'ordinal-hint' });
+        this.renderProgress(contentEl);
+
+        const grid = contentEl.createDiv({ cls: 'ordinal-grid' });
+        const yes = grid.createEl('button', { text: 'Yes, urgent now → Do', cls: 'ordinal-choice' });
+        grid.createDiv({ cls: 'ordinal-vs', text: '/' });
+        const no  = grid.createEl('button', { text: 'No, keep in Schedule', cls: 'ordinal-choice' });
+        yes.addEventListener('click', () => this.review(item, true));
+        no .addEventListener('click', () => this.review(item, false));
+
+        closeHint(contentEl, 'Close anytime — answers so far are saved; the rest stay in Schedule.');
+    }
+
+    review(item, urgent) {
+        if (urgent) {
+            // Promoted items go to the top of Do, keeping their Schedule order.
+            this.sections.Q2.splice(this.sections.Q2.indexOf(item), 1);
+            this.sections.Q1.splice(this.promoted.size, 0, item);
+            this.promoted.add(item);
+        }
+        this.reviewIdx++;
+        this.nextReview();
+    }
+
     // Binary-search the current item into `list` (mutated in place), so later
     // inbox items are also compared against the ones placed before them.
     startPlacement(list) {
@@ -1238,11 +1284,12 @@ class TriageInboxModal extends obsidian.Modal {
     renderResults() {
         const { contentEl } = this;
         contentEl.empty();
-        contentEl.createEl('h2', { text: '✓ Inbox Triaged' });
-        contentEl.createEl('p', {
-            text: `${this.queue.length} item${this.queue.length === 1 ? '' : 's'} placed (★). The Inbox will be emptied.`,
-            cls: 'ordinal-hint'
-        });
+        contentEl.createEl('h2', { text: this.hasReview() ? '✓ Triage Complete' : '✓ Inbox Triaged' });
+        const plural = (n) => `${n} item${n === 1 ? '' : 's'}`;
+        const summary = [];
+        if (this.queue.length > 0) summary.push(`${plural(this.queue.length)} placed from the Inbox (★).`);
+        if (this.hasReview()) summary.push(`${plural(this.promoted.size)} moved from Schedule up to Do (↑).`);
+        contentEl.createEl('p', { text: summary.join(' '), cls: 'ordinal-hint' });
 
         const renderList = (parent, items) => {
             const ol = parent.createEl('ol', { cls: 'ordinal-results-list' });
@@ -1251,6 +1298,9 @@ class TriageInboxModal extends obsidian.Modal {
                 if (this.placed.has(item)) {
                     li.addClass('ordinal-new-highlight');
                     li.createSpan({ text: `★ ${item.text}` });
+                } else if (this.promoted.has(item)) {
+                    li.addClass('ordinal-new-highlight');
+                    li.createSpan({ text: `↑ ${item.text}` });
                 } else {
                     li.createSpan({ text: item.text });
                 }
@@ -2572,15 +2622,22 @@ class DrakeFactotumPlugin extends obsidian.Plugin {
                 const content = editor.getValue();
                 const parsed  = parseNote(content);
                 const inbox = parsed.mode === 'flat' ? parsed.inbox : parsed.sections.inbox;
-                if (inbox.length === 0) {
-                    new obsidian.Notice('Factotum: no items under an "Inbox" heading in this note.');
+                // A matrix triage also reviews Schedule, so it has work to do
+                // even with an empty Inbox.
+                const schedule = parsed.mode === 'flat' ? [] : parsed.sections.Q2;
+                if (inbox.length === 0 && schedule.length === 0) {
+                    new obsidian.Notice(parsed.mode === 'flat'
+                        ? 'Factotum: no items under an "Inbox" heading in this note.'
+                        : 'Factotum: nothing in the Inbox or Schedule to triage.');
                     return;
                 }
                 new TriageInboxModal(this.app, parsed, async (result, partial) => {
                     if (!await this.saveResult(editorTarget(editor), content, parsed, result)) return;
                     if (partial) {
                         const left = (result.mode === 'flat' ? result.inbox : result.sections.inbox).length;
-                        new obsidian.Notice(`Factotum: triage interrupted — placed items saved, ${left} still in the Inbox.`);
+                        new obsidian.Notice(left > 0
+                            ? `Factotum: triage interrupted — placed items saved, ${left} still in the Inbox.`
+                            : 'Factotum: triage interrupted — progress saved; unreviewed items stay in Schedule.');
                     } else {
                         new obsidian.Notice('Factotum: inbox triaged ✓');
                     }

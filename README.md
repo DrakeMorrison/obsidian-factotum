@@ -65,12 +65,14 @@ Add an `## Inbox` heading to your TODO note and toss unprioritized bullets under
 
 Each inbox item is walked through the usual flow — in a matrix note you classify it (urgent? important?) and it lands at the top of that quadrant, so newer items read first; in a flat note it's binary-search-placed into the ranked list. On save, every item lands in its spot and the Inbox is emptied (the heading stays, ready for the next capture).
 
+In a matrix note, triage then reviews **Schedule — Important, Not Urgent**. These items are already important, so each one gets only the urgency question ("must it get done this week now?"). Anything that has become urgent moves to the top of **Do**; everything else stays put. Items the Inbox just put into Schedule aren't re-asked. Because of this review, a matrix note can be triaged even when the Inbox is empty.
+
 ### Stopping partway — progress is saved
 
 Every interactive session can be closed at any point (Esc, the ✕, or clicking outside) without losing the decisions you've already made:
 
 - **Ranking session** — decisions made so far are kept: in a flat note, fully merged groups stay in their decided order; in a matrix note, items already re-classified keep their new quadrant. Everything not yet reached keeps its current place. Run the session again later to finish the job.
-- **Triage inbox** — items you've already placed are saved into position; the current item and anything you didn't reach stay in the Inbox for next time.
+- **Triage inbox** — items you've already placed are saved into position; the current item and anything you didn't reach stay in the Inbox for next time. Schedule items you've reviewed keep their answer; unreviewed ones stay in Schedule.
 - **Add new item** — in a flat note, closing mid-placement saves the item at the midpoint of the range your answers have narrowed it to; in a matrix note, closing before classifying drops it into the Inbox instead.
 - **Convert to matrix** — items you've classified land in their quadrants; the rest go to the Inbox.
 
